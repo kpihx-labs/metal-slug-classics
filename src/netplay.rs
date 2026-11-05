@@ -93,6 +93,8 @@ impl Default for DiscoveryOptions {
 struct LocalIpv4Interface {
     address: Ipv4Addr,
     netmask: Ipv4Addr,
+    prefix_length: u8,
+    broadcast: Option<Ipv4Addr>,
 }
 
 #[must_use]
@@ -118,7 +120,8 @@ fn is_private_lan(address: Ipv4Addr) -> bool {
 /// Lists usable local IPv4 addresses. Public addresses are excluded unless explicitly allowed.
 ///
 /// # Errors
-/// Returns an error when interfaces cannot be enumerated or an explicit address is unavailable.
+/// Returns an error when interfaces cannot be enumerated, the default route is unusable, or an
+/// explicit address is unavailable.
 pub fn local_interfaces(requested: &[Ipv4Addr], allow_public: bool) -> Result<Vec<Ipv4Addr>> {
     Ok(selected_local_interfaces(requested, allow_public)?
         .into_iter()
@@ -138,18 +141,38 @@ fn selected_local_interfaces(
                 Some(LocalIpv4Interface {
                     address: address.ip,
                     netmask: address.netmask,
+                    prefix_length: address.prefixlen,
+                    broadcast: address.broadcast,
                 })
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    select_interfaces(available, requested, allow_public)
+    let default_route = if requested.is_empty() {
+        Some(default_route_ipv4()?)
+    } else {
+        None
+    };
+    select_interfaces(available, requested, allow_public, default_route)
+}
+
+fn default_route_ipv4() -> Result<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("bind socket for default IPv4 route probe")?;
+    socket
+        .connect((Ipv4Addr::new(1, 1, 1, 1), 9))
+        .context("probe active default IPv4 route")?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V4(address) if !address.is_unspecified() => Ok(address),
+        address => bail!("default route probe returned unusable local address {address}"),
+    }
 }
 
 fn select_interfaces(
     mut available: Vec<LocalIpv4Interface>,
     requested: &[Ipv4Addr],
     allow_public: bool,
+    default_route: Option<Ipv4Addr>,
 ) -> Result<Vec<LocalIpv4Interface>> {
     available.sort_unstable();
     available.dedup();
@@ -164,6 +187,17 @@ fn select_interfaces(
             if !allow_public && !is_private_or_local(*address) {
                 bail!(
                     "requested interface address {address} is public; pass --allow-public-lan to opt in"
+                );
+            }
+            let interface = available
+                .iter()
+                .find(|interface| interface.address == *address)
+                .expect("requested interface was already found");
+            if !address.is_loopback()
+                && (interface.broadcast.is_none() || interface.prefix_length >= 32)
+            {
+                bail!(
+                    "requested interface address {address} is not broadcast-capable with a prefix shorter than /32"
                 );
             }
         }
@@ -185,28 +219,31 @@ fn select_interfaces(
         }
         return Ok(selected);
     }
-    let mut selected = available
+    let default_route = default_route.context("no active default IPv4 route found")?;
+    let interface = available
         .iter()
         .copied()
-        .filter(|interface| is_private_lan(interface.address))
-        .collect::<Vec<_>>();
-    if selected.is_empty() && allow_public {
-        selected = available
-            .iter()
-            .copied()
-            .filter(|interface| !interface.address.is_loopback())
-            .collect::<Vec<_>>();
+        .find(|interface| interface.address == default_route)
+        .with_context(|| {
+            format!(
+                "active default-route IPv4 address {default_route} was not found among local interfaces"
+            )
+        })?;
+    if interface.address.is_loopback()
+        || interface.broadcast.is_none()
+        || interface.prefix_length >= 32
+    {
+        bail!(
+            "active default-route IPv4 address {default_route} is a tunnel or non-broadcast interface (prefix /{}); select a LAN address explicitly with --interface",
+            interface.prefix_length
+        );
     }
-    if selected.is_empty() {
-        selected = available
-            .into_iter()
-            .filter(|interface| interface.address.is_loopback())
-            .collect::<Vec<_>>();
+    if !allow_public && !is_private_lan(interface.address) {
+        bail!(
+            "active default-route IPv4 address {default_route} is public; pass --allow-public-lan to opt in or select a private LAN address with --interface"
+        );
     }
-    if selected.is_empty() {
-        bail!("no usable private/link-local or loopback IPv4 interface found");
-    }
-    Ok(selected)
+    Ok(vec![interface])
 }
 
 #[must_use]
@@ -331,7 +368,7 @@ pub fn discover(options: &DiscoveryOptions) -> Result<Vec<DiscoveredSession>> {
 /// Returns an error when serialization, socket setup, or every send attempt fails.
 pub fn advertise_once(packet: &DiscoveryPacket, options: &DiscoveryOptions) -> Result<()> {
     validate_discovery_options(options)?;
-    let interfaces = local_interfaces(&options.interfaces, options.allow_public)?;
+    let interfaces = selected_local_interfaces(&options.interfaces, options.allow_public)?;
     let payload = serde_json::to_vec(packet).context("serialize discovery packet")?;
     if payload.len() > MAX_PACKET_BYTES {
         bail!("discovery packet exceeds {MAX_PACKET_BYTES} bytes");
@@ -339,13 +376,17 @@ pub fn advertise_once(packet: &DiscoveryPacket, options: &DiscoveryOptions) -> R
     let mut successes = 0_usize;
     let mut last_error = None;
     for interface in interfaces {
-        let socket = UdpSocket::bind((interface, 0))?;
+        let socket = UdpSocket::bind((interface.address, 0))?;
         socket.set_broadcast(true)?;
         socket.set_multicast_ttl_v4(1)?;
-        for target in [
-            SocketAddr::from((Ipv4Addr::BROADCAST, options.discovery_port)),
-            SocketAddr::from((options.multicast_address, options.discovery_port)),
-        ] {
+        let mut targets = vec![SocketAddr::from((
+            options.multicast_address,
+            options.discovery_port,
+        ))];
+        if let Some(broadcast) = interface.broadcast {
+            targets.push(SocketAddr::from((broadcast, options.discovery_port)));
+        }
+        for target in targets {
             match socket.send_to(&payload, target) {
                 Ok(_) => successes += 1,
                 Err(error) => last_error = Some(error),
@@ -753,121 +794,124 @@ mod tests {
         assert!(!is_private_or_local("8.8.8.8".parse().unwrap()));
     }
 
+    fn interface(
+        address: &str,
+        netmask: &str,
+        prefix_length: u8,
+        broadcast: Option<&str>,
+    ) -> LocalIpv4Interface {
+        LocalIpv4Interface {
+            address: address.parse().unwrap(),
+            netmask: netmask.parse().unwrap(),
+            prefix_length,
+            broadcast: broadcast.map(|value| value.parse().unwrap()),
+        }
+    }
+
     #[test]
-    fn interface_selection_prefers_lan_addresses_before_loopback() {
-        let selected = select_interfaces(
-            vec![
-                LocalIpv4Interface {
-                    address: "127.0.0.1".parse().unwrap(),
-                    netmask: "255.0.0.0".parse().unwrap(),
-                },
-                LocalIpv4Interface {
-                    address: "192.168.1.10".parse().unwrap(),
-                    netmask: "255.255.255.0".parse().unwrap(),
-                },
-                LocalIpv4Interface {
-                    address: "169.254.20.30".parse().unwrap(),
-                    netmask: "255.255.0.0".parse().unwrap(),
-                },
-            ],
-            &[],
-            false,
-        )
-        .unwrap();
+    fn automatic_selection_uses_only_default_route_without_private_bridge_fallback() {
+        let lan = interface("192.168.1.10", "255.255.255.0", 24, Some("192.168.1.255"));
+        let inactive_bridge = interface("172.17.0.1", "255.255.0.0", 16, Some("172.17.255.255"));
         assert_eq!(
-            selected,
-            vec![
-                LocalIpv4Interface {
-                    address: "169.254.20.30".parse().unwrap(),
-                    netmask: "255.255.0.0".parse().unwrap(),
-                },
-                LocalIpv4Interface {
-                    address: "192.168.1.10".parse().unwrap(),
-                    netmask: "255.255.255.0".parse().unwrap(),
-                },
-            ]
+            select_interfaces(vec![inactive_bridge, lan], &[], false, Some(lan.address)).unwrap(),
+            vec![lan]
         );
-        let loopback_only = select_interfaces(
-            vec![LocalIpv4Interface {
-                address: "127.0.0.1".parse::<Ipv4Addr>().unwrap(),
-                netmask: "255.0.0.0".parse().unwrap(),
-            }],
+
+        let error = select_interfaces(
+            vec![inactive_bridge],
             &[],
             false,
+            Some("192.168.1.10".parse().unwrap()),
         )
-        .unwrap();
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not found among local interfaces"));
+    }
+
+    #[test]
+    fn automatic_32_bit_tunnel_is_rejected_actionably() {
+        let tunnel = interface("100.64.0.2", "255.255.255.255", 32, None);
+        let error = select_interfaces(vec![tunnel], &[], false, Some(tunnel.address))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tunnel or non-broadcast interface"));
+        assert!(error.contains("--interface"));
+    }
+
+    #[test]
+    fn public_default_route_requires_explicit_opt_in() {
+        let public = interface("8.8.8.8", "255.255.255.0", 24, Some("8.8.8.255"));
+        let error = select_interfaces(vec![public], &[], false, Some(public.address))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--allow-public-lan"));
         assert_eq!(
-            loopback_only,
-            vec![LocalIpv4Interface {
-                address: "127.0.0.1".parse::<Ipv4Addr>().unwrap(),
-                netmask: "255.0.0.0".parse().unwrap(),
-            }]
+            select_interfaces(vec![public], &[], true, Some(public.address)).unwrap(),
+            vec![public]
         );
     }
 
     #[test]
-    fn public_interface_use_requires_explicit_opt_in() {
-        let public = "8.8.8.8".parse::<Ipv4Addr>().unwrap();
-        assert!(
+    fn explicit_selection_preserves_multiple_interfaces_and_loopback() {
+        let loopback = interface("127.0.0.1", "255.0.0.0", 8, None);
+        let lan = interface("192.168.1.10", "255.255.255.0", 24, Some("192.168.1.255"));
+        assert_eq!(
             select_interfaces(
-                vec![LocalIpv4Interface {
-                    address: public,
-                    netmask: "255.255.255.0".parse().unwrap(),
-                }],
-                &[],
+                vec![lan, loopback],
+                &[loopback.address, lan.address],
                 false,
-            )
-            .is_err()
-        );
-        assert_eq!(
-            select_interfaces(
-                vec![LocalIpv4Interface {
-                    address: public,
-                    netmask: "255.255.255.0".parse().unwrap(),
-                }],
-                &[],
-                true,
+                None,
             )
             .unwrap(),
-            vec![LocalIpv4Interface {
-                address: public,
-                netmask: "255.255.255.0".parse().unwrap(),
-            }]
+            vec![loopback, lan]
         );
-        assert_eq!(
-            select_interfaces(
-                vec![
-                    LocalIpv4Interface {
-                        address: "127.0.0.1".parse::<Ipv4Addr>().unwrap(),
-                        netmask: "255.0.0.0".parse().unwrap(),
-                    },
-                    LocalIpv4Interface {
-                        address: public,
-                        netmask: "255.255.255.0".parse().unwrap(),
-                    },
-                ],
-                &[],
-                true,
-            )
-            .unwrap(),
-            vec![LocalIpv4Interface {
-                address: public,
-                netmask: "255.255.255.0".parse().unwrap(),
-            }]
-        );
+    }
+
+    #[test]
+    fn explicit_nonexistent_address_is_rejected() {
+        let error = select_interfaces(
+            vec![interface(
+                "192.168.1.10",
+                "255.255.255.0",
+                24,
+                Some("192.168.1.255"),
+            )],
+            &["192.168.1.99".parse().unwrap()],
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("is not local"));
+    }
+
+    #[test]
+    fn explicit_non_loopback_must_be_broadcast_capable() {
+        let tunnel = interface("10.0.0.2", "255.255.255.255", 32, None);
+        let error = select_interfaces(vec![tunnel], &[tunnel.address], false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not broadcast-capable"));
+    }
+
+    #[test]
+    fn real_22_bit_netmask_controls_source_subnet() {
+        let lan = interface("192.168.4.10", "255.255.252.0", 22, Some("192.168.7.255"));
+        assert!(source_matches_interface(
+            "192.168.7.200".parse().unwrap(),
+            lan
+        ));
+        assert!(!source_matches_interface(
+            "192.168.8.1".parse().unwrap(),
+            lan
+        ));
     }
 
     #[test]
     fn discovery_sources_must_match_selected_interface_subnets() {
         let interfaces = [
-            LocalIpv4Interface {
-                address: "192.168.1.10".parse().unwrap(),
-                netmask: "255.255.255.0".parse().unwrap(),
-            },
-            LocalIpv4Interface {
-                address: "169.254.20.30".parse().unwrap(),
-                netmask: "255.255.0.0".parse().unwrap(),
-            },
+            interface("192.168.1.10", "255.255.255.0", 24, Some("192.168.1.255")),
+            interface("169.254.20.30", "255.255.0.0", 16, Some("169.254.255.255")),
         ];
         assert!(source_matches_selected_interfaces(
             "192.168.1.200".parse().unwrap(),
@@ -890,14 +934,8 @@ mod tests {
     #[test]
     fn explicit_loopback_selection_preserves_loopback_discovery() {
         let interfaces = [
-            LocalIpv4Interface {
-                address: "127.0.0.1".parse().unwrap(),
-                netmask: "255.0.0.0".parse().unwrap(),
-            },
-            LocalIpv4Interface {
-                address: "192.168.1.10".parse().unwrap(),
-                netmask: "255.255.255.0".parse().unwrap(),
-            },
+            interface("127.0.0.1", "255.0.0.0", 8, None),
+            interface("192.168.1.10", "255.255.255.0", 24, Some("192.168.1.255")),
         ];
         assert!(source_matches_selected_interfaces(
             "127.0.0.1".parse().unwrap(),

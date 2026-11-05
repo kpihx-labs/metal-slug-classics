@@ -30,3 +30,6 @@
   so RetroArch netplay always loads a real, governed core.
 - Add synthetic ZIP, CRC metadata, profile path, runtime, and netplay tests plus
   end-to-end opposite-role/cross-path agreement and BIOS command tests.
+- Select automatic LAN discovery only from the active default-route IPv4
+  interface, reject tunnels and inactive bridge fallbacks, and use reported
+  prefixes, netmasks, and directed broadcast addresses.

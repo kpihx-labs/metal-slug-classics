@@ -100,12 +100,14 @@ over same-subnet UDP broadcast and administratively scoped multicast (TTL 1).
 Discovery listens briefly, ignores malformed and stale packets, and accepts
 only source addresses that match a subnet represented by the selected local
 interfaces, while preserving explicit loopback selection. Automatic local
-interface selection prefers private/link-local IPv4 LAN addresses and falls
-back to opted-in public IPv4 addresses and finally loopback only when no LAN
-address is available; repeat `--interface` to select exact local IPv4
-addresses, including loopback. `--discovery-port`, `--multicast-address`, and
-`--game-port` override the defaults. Public-address interface use, including
-automatic fallback, requires the explicit `--allow-public-lan` opt-in.
+interface selection uses only the active default-route IPv4 address and requires
+a real broadcast address and a prefix shorter than `/32`; it never falls back to
+inactive private bridges. A tunnel default route fails with an actionable error.
+Repeat `--interface` to select exact local broadcast-capable IPv4 addresses, or
+loopback for diagnostics. `--discovery-port`, `--multicast-address`, and
+`--game-port` override the defaults. Public-address interface use requires the
+explicit `--allow-public-lan` opt-in. Directed broadcasts and source-subnet
+checks use the interface's reported broadcast address and netmask.
 
 `lan host` prepares an exact RetroArch launch with `--host --port` before the
 single content archive, advertises its

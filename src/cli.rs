@@ -108,7 +108,10 @@ enum LanCommand {
 
 #[derive(Clone, Debug, Args)]
 struct DiscoveryArgs {
-    #[arg(long = "interface", help = "Local IPv4 address to use; repeatable")]
+    #[arg(
+        long = "interface",
+        help = "Local broadcast-capable IPv4 address to use; repeatable; loopback allowed for diagnostics"
+    )]
     interfaces: Vec<Ipv4Addr>,
     #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
     discovery_port: u16,
@@ -116,7 +119,7 @@ struct DiscoveryArgs {
     multicast_address: Ipv4Addr,
     #[arg(
         long,
-        help = "Permit public-address interface use, including automatic fallback when no private/link-local LAN address is available"
+        help = "Permit use of a broadcast-capable public IPv4 address selected explicitly or by the active default route"
     )]
     allow_public_lan: bool,
 }
@@ -754,12 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn lan_help_describes_public_interface_fallback_truthfully() {
+    fn lan_help_describes_public_interface_opt_in_truthfully() {
         let help = Cli::try_parse_from(["metal-slug-classics", "lan", "doctor", "--help"])
             .unwrap_err()
             .to_string();
-        assert!(help.contains("Permit public-address interface use"));
-        assert!(help.contains("automatic fallback"));
+        assert!(help.contains("Permit use of a broadcast-capable public IPv4 address"));
+        assert!(help.contains("active default route"));
     }
 
     #[test]
