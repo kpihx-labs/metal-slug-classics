@@ -21,18 +21,21 @@ while IFS= read -r tracked; do
     esac
 done < <(git -C "$ROOT" ls-files)
 
-expected_submodule="$(git -C "$ROOT" rev-parse HEAD:vendor/fbneo)"
-actual_submodule="$(git -C "$ROOT/vendor/fbneo" rev-parse HEAD)"
-[[ "$actual_submodule" == "$expected_submodule" ]] || {
-    printf 'FBNeo submodule mismatch: expected %s, found %s\n' \
-        "$expected_submodule" "$actual_submodule" >&2
-    exit 1
-}
-submodule_changes="$(git -C "$ROOT/vendor/fbneo" status --porcelain)"
-[[ -z "$submodule_changes" ]] || {
-    printf 'FBNeo submodule has local changes:\n%s\n' "$submodule_changes" >&2
-    exit 1
-}
+for submodule in vendor/fbneo vendor/fbneo-libretro; do
+    expected_submodule="$(git -C "$ROOT" rev-parse ":$submodule")"
+    actual_submodule="$(git -C "$ROOT/$submodule" rev-parse HEAD)"
+    [[ "$actual_submodule" == "$expected_submodule" ]] || {
+        printf '%s submodule mismatch: expected %s, found %s\n' \
+            "$submodule" "$expected_submodule" "$actual_submodule" >&2
+        exit 1
+    }
+    submodule_changes="$(git -C "$ROOT/$submodule" status --porcelain)"
+    [[ -z "$submodule_changes" ]] || {
+        printf '%s submodule has local changes:\n%s\n' \
+            "$submodule" "$submodule_changes" >&2
+        exit 1
+    }
+done
 
 check_hash fe2b00e2ca24dbf54cab37ae288b3cbc975881856301b807a31f25fe09a01d13 \
     "$ROOT/work/tools/linux-sdl2-x86_64.zip"

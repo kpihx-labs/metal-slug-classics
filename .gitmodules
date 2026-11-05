@@ -1,3 +1,6 @@
 [submodule "vendor/fbneo"]
 	path = vendor/fbneo
 	url = git@github.com:kpihx-labs/FBNeo.git
+[submodule "vendor/fbneo-libretro"]
+	path = vendor/fbneo-libretro
+	url = git@github.com:kpihx-labs/FBNeo-libretro.git

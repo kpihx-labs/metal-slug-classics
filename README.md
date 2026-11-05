@@ -128,6 +128,7 @@ The project doctor also requires the pinned Linux/Windows runtime archives,
 their exact SHA-256 hashes, and the pinned local FBNeo/MAME executables. Missing
 research tool artifacts are a failure, not an optional skip.
 
-FinalBurn Neo is pinned as `vendor/fbneo`. The libretro build is the primary
-player runtime; standalone SDL2 remains the diagnostic fallback. MAME remains
-an independent preservation oracle.
+FinalBurn Neo standalone is pinned as `vendor/fbneo`; the separately maintained
+libretro port is pinned as `vendor/fbneo-libretro`. The libretro build is the
+primary player runtime; standalone SDL2 remains the diagnostic fallback. MAME
+remains an independent preservation oracle.

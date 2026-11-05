@@ -26,5 +26,7 @@
   defaults with explicit public-interface opt-in.
 - Add stable JSON failure envelopes and strict pinned archive/executable doctor
   gates.
+- Pin the maintained libretro FBNeo port separately from the standalone engine
+  so RetroArch netplay always loads a real, governed core.
 - Add synthetic ZIP, CRC metadata, profile path, runtime, and netplay tests plus
   end-to-end opposite-role/cross-path agreement and BIOS command tests.
