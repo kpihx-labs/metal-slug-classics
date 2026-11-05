@@ -132,3 +132,7 @@ FinalBurn Neo standalone is pinned as `vendor/fbneo`; the separately maintained
 libretro port is pinned as `vendor/fbneo-libretro`. The libretro build is the
 primary player runtime; standalone SDL2 remains the diagnostic fallback. MAME
 remains an independent preservation oracle.
+
+Build the exact pinned Linux core with `make build-core`. The generated core
+and SHA-256 manifest live under `work/cores/linux-x86_64/` and remain outside
+Git.

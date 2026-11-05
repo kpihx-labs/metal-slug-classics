@@ -1,4 +1,4 @@
-.PHONY: check doctor push
+.PHONY: check doctor build-core push
 
 check:
 	@cargo fmt --check
@@ -12,6 +12,9 @@ check:
 doctor:
 	@./scripts/doctor.sh
 	@cargo run --quiet -- doctor
+
+build-core:
+	./scripts/build-core.sh
 
 push:
 	git push github main
