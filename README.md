@@ -135,6 +135,6 @@ libretro port is pinned as `vendor/fbneo-libretro`. The libretro build is the
 primary player runtime; standalone SDL2 remains the diagnostic fallback. MAME
 remains an independent preservation oracle.
 
-Build the exact pinned Linux core with `make build-core`. The generated core
-and SHA-256 manifest live under `work/cores/linux-x86_64/` and remain outside
-Git.
+Build the exact pinned Linux core with `make build-core`, the Windows core with
+`make build-core-windows`, or both with `make build-cores`. Generated cores and
+SHA-256 manifests live under `work/cores/<platform>/` and remain outside Git.

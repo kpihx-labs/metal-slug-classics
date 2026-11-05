@@ -1,4 +1,4 @@
-.PHONY: check doctor build-core push
+.PHONY: check doctor build-core build-core-windows build-cores push
 
 check:
 	@cargo fmt --check
@@ -14,7 +14,13 @@ doctor:
 	@cargo run --quiet -- doctor
 
 build-core:
-	./scripts/build-core.sh
+	./scripts/build-core.sh linux
+
+build-core-windows:
+	./scripts/build-core.sh windows
+
+build-cores:
+	./scripts/build-core.sh all
 
 push:
 	git push github main
