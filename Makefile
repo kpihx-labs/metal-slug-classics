@@ -1,4 +1,4 @@
-.PHONY: check doctor
+.PHONY: check doctor push
 
 check:
 	@shellcheck scripts/*.sh
@@ -6,3 +6,6 @@ check:
 
 doctor:
 	@./scripts/doctor.sh
+
+push:
+	git push github main

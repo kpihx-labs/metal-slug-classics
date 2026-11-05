@@ -1,0 +1,3 @@
+[submodule "vendor/fbneo"]
+	path = vendor/fbneo
+	url = git@github.com:kpihx-labs/FBNeo.git
