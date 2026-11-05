@@ -1,7 +1,11 @@
 use crate::audit::{ArchiveAudit, AuditReport, MemberState, audit_path};
 use crate::manifest::{GameId, manifests};
-use crate::netplay::{AgreementReport, compare, load as load_contract};
-use crate::profile::{self, Profile, RuntimeKind};
+use crate::netplay::{
+    AgreementReport, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, DEFAULT_MULTICAST_ADDRESS,
+    DiscoveryOptions, DiscoveryPacket, advertise_once, compare, discover, load as load_contract,
+    local_interfaces, new_packet, now_unix_ms, select_compatible,
+};
+use crate::profile::{self, NetplayRole, Profile, RuntimeKind};
 use crate::runtime;
 use anyhow::{Result, bail};
 use clap::error::ErrorKind;
@@ -10,7 +14,12 @@ use serde::Serialize;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(name = "metal-slug-classics", version, about)]
@@ -91,7 +100,77 @@ struct ProfileCreateArgs {
 
 #[derive(Debug, Subcommand)]
 enum LanCommand {
-    Doctor,
+    Doctor(DiscoveryArgs),
+    Discover(DiscoverArgs),
+    Host(LanHostArgs),
+    Join(LanJoinArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct DiscoveryArgs {
+    #[arg(long = "interface", help = "Local IPv4 address to use; repeatable")]
+    interfaces: Vec<Ipv4Addr>,
+    #[arg(long, default_value_t = DEFAULT_DISCOVERY_PORT)]
+    discovery_port: u16,
+    #[arg(long, default_value_t = DEFAULT_MULTICAST_ADDRESS)]
+    multicast_address: Ipv4Addr,
+    #[arg(
+        long,
+        help = "Permit public-address interface use, including automatic fallback when no private/link-local LAN address is available"
+    )]
+    allow_public_lan: bool,
+}
+
+impl DiscoveryArgs {
+    fn options(&self, timeout: Duration) -> DiscoveryOptions {
+        DiscoveryOptions {
+            interfaces: self.interfaces.clone(),
+            discovery_port: self.discovery_port,
+            multicast_address: self.multicast_address,
+            timeout,
+            allow_public: self.allow_public_lan,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct DiscoverArgs {
+    #[command(flatten)]
+    discovery: DiscoveryArgs,
+    #[arg(long, default_value_t = 3_000)]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct LanHostArgs {
+    game: GameId,
+    #[arg(long, default_value = "default")]
+    profile: String,
+    #[command(flatten)]
+    discovery: DiscoveryArgs,
+    #[arg(long, default_value_t = DEFAULT_GAME_PORT)]
+    game_port: u16,
+    #[arg(long, default_value_t = 2_000)]
+    advertisement_ttl_ms: u64,
+    #[arg(long, default_value_t = 120)]
+    reconnect_seconds: u64,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct LanJoinArgs {
+    game: GameId,
+    #[arg(long, default_value = "default")]
+    profile: String,
+    #[command(flatten)]
+    discovery: DiscoveryArgs,
+    #[arg(long, default_value_t = 3_000)]
+    timeout_ms: u64,
+    #[arg(long, help = "Reconnect to this advertised session ID")]
+    session_id: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +190,8 @@ struct LanDoctorReport {
     local_contract: Option<PathBuf>,
     peer_contract: Option<PathBuf>,
     agreement: Option<AgreementReport>,
+    interfaces: Vec<Ipv4Addr>,
+    discovery_port: u16,
     requirements: Vec<&'static str>,
 }
 
@@ -192,9 +273,16 @@ where
             .map_err(|error| command_failure("play-failed", &error)),
         Command::Profile { command } => profile_command(command, cli.json)
             .map_err(|error| command_failure("profile-failed", &error)),
-        Command::Lan {
-            command: LanCommand::Doctor,
-        } => lan_doctor(cli.json).map_err(|error| command_failure("lan-doctor-failed", &error)),
+        Command::Lan { command } => match command {
+            LanCommand::Doctor(arguments) => lan_doctor(&arguments, cli.json)
+                .map_err(|error| command_failure("lan-doctor-failed", &error)),
+            LanCommand::Discover(arguments) => lan_discover(&arguments, cli.json)
+                .map_err(|error| command_failure("lan-discover-failed", &error)),
+            LanCommand::Host(arguments) => lan_host(&arguments, cli.json)
+                .map_err(|error| command_failure("lan-host-failed", &error)),
+            LanCommand::Join(arguments) => lan_join(&arguments, cli.json)
+                .map_err(|error| command_failure("lan-join-failed", &error)),
+        },
     }
 }
 
@@ -385,7 +473,8 @@ fn profile_command(command: ProfileCommand, json: bool) -> Result<()> {
     }
 }
 
-fn lan_doctor(json: bool) -> Result<()> {
+fn lan_doctor(arguments: &DiscoveryArgs, json: bool) -> Result<()> {
+    let interfaces = local_interfaces(&arguments.interfaces, arguments.allow_public_lan)?;
     let local_path = env::var_os("METAL_SLUG_LOCAL_CONTRACT").map(PathBuf::from);
     let peer_path = env::var_os("METAL_SLUG_PEER_CONTRACT").map(PathBuf::from);
     let agreement = match (&local_path, &peer_path) {
@@ -413,14 +502,20 @@ fn lan_doctor(json: bool) -> Result<()> {
         local_contract: local_path,
         peer_contract: peer_path,
         agreement,
+        interfaces,
+        discovery_port: arguments.discovery_port,
         requirements: vec![
             "same game and canonical typed-manifest content",
             "same runtime/core compatibility IDs, ROM, BIOS, and behavioral settings",
-            "same-subnet direct RetroArch netplay with public announce disabled",
+            "same-subnet direct RetroArch netplay with public announce, NAT traversal, and MITM relay disabled",
         ],
     };
     emit(&report, json, |value| {
         println!("LAN doctor: {}", value.status);
+        println!("  discovery port: {}", value.discovery_port);
+        for interface in &value.interfaces {
+            println!("  interface: {interface}");
+        }
         for requirement in &value.requirements {
             println!("  - {requirement}");
         }
@@ -430,6 +525,178 @@ fn lan_doctor(json: bool) -> Result<()> {
             }
         }
     })?;
+    Ok(())
+}
+
+fn lan_discover(arguments: &DiscoverArgs, json: bool) -> Result<()> {
+    let sessions = discover(
+        &arguments
+            .discovery
+            .options(Duration::from_millis(arguments.timeout_ms)),
+    )?;
+    emit(&sessions, json, |values| {
+        if values.is_empty() {
+            println!("No active LAN sessions found");
+        }
+        for session in values {
+            println!(
+                "{} game={} host={}:{} reconnect-until={}",
+                session.session_id,
+                session.contract.game,
+                session.source.ip(),
+                session.game_port,
+                session.reconnect_until_unix_ms
+            );
+        }
+    })
+}
+
+fn lan_profile(name: &str, role: NetplayRole, peer: Option<String>, port: u16) -> Result<Profile> {
+    if port == 0 {
+        bail!("game port must not be zero");
+    }
+    let mut profile = profile::load(name)?;
+    if profile.runtime != RuntimeKind::Libretro {
+        bail!("LAN orchestration requires a libretro/RetroArch profile");
+    }
+    profile.netplay.enabled = true;
+    profile.netplay.role = role;
+    profile.netplay.peer_address = peer;
+    profile.netplay.port = port;
+    profile.netplay.require_peer_contract = false;
+    Ok(profile)
+}
+
+fn lan_host(arguments: &LanHostArgs, json: bool) -> Result<()> {
+    if arguments.advertisement_ttl_ms == 0 || arguments.advertisement_ttl_ms > 60_000 {
+        bail!("advertisement TTL must be between 1 and 60000 milliseconds");
+    }
+    if arguments.reconnect_seconds == 0 {
+        bail!("reconnect window must be at least one second");
+    }
+    let profile = lan_profile(
+        &arguments.profile,
+        NetplayRole::Host,
+        None,
+        arguments.game_port,
+    )?;
+    let plan = runtime::prepare(&profile, arguments.game)?;
+    let started = now_unix_ms();
+    let session_id = format!(
+        "{}-{}-{}",
+        plan.session_contract.game,
+        started,
+        &plan.session_contract.behavior_sha256[..12]
+    );
+    let packet = new_packet(
+        session_id,
+        plan.session_contract.clone(),
+        arguments.game_port,
+        started,
+        Duration::from_millis(arguments.advertisement_ttl_ms),
+        Duration::from_secs(arguments.reconnect_seconds),
+    );
+    let options = arguments.discovery.options(Duration::ZERO);
+    local_interfaces(&options.interfaces, options.allow_public)?;
+    if json || arguments.dry_run {
+        emit(
+            &serde_json::json!({ "packet": &packet, "launch": &plan }),
+            json,
+            |value| {
+                println!("session: {}", value["packet"]["session_id"]);
+                println!("command: {}", plan.arguments.join(" "));
+            },
+        )?;
+    }
+    if arguments.dry_run {
+        return Ok(());
+    }
+    advertise_once(&packet, &options)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let advertiser_running = Arc::clone(&running);
+    let advertiser_options = options.clone();
+    let base_packet = packet;
+    let ttl_ms = arguments.advertisement_ttl_ms;
+    let reconnect_ms = arguments.reconnect_seconds.saturating_mul(1_000);
+    let advertiser = thread::spawn(move || {
+        while advertiser_running.load(Ordering::Relaxed) {
+            let now = now_unix_ms();
+            let advertisement = refreshed_advertisement(&base_packet, now, ttl_ms, reconnect_ms);
+            if let Err(error) = advertise_once(&advertisement, &advertiser_options) {
+                eprintln!("warning: LAN advertisement failed: {error:#}");
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+    let launch_result = runtime::launch(&plan);
+    running.store(false, Ordering::Relaxed);
+    advertiser
+        .join()
+        .map_err(|_| anyhow::anyhow!("LAN advertiser thread panicked"))?;
+    let status = launch_result?;
+    if !status.success() {
+        bail!("runtime exited with {status}");
+    }
+    Ok(())
+}
+
+fn lan_join(arguments: &LanJoinArgs, json: bool) -> Result<()> {
+    let options = arguments
+        .discovery
+        .options(Duration::from_millis(arguments.timeout_ms));
+    let sessions = discover(&options)?;
+    if sessions.is_empty() {
+        bail!("no active LAN sessions found");
+    }
+    let candidate = sessions
+        .iter()
+        .find(|session| {
+            session.contract.game == arguments.game.to_string()
+                && arguments
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|id| id == &session.session_id)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no advertised session matches game/session selection"))?;
+    let peer = candidate.source.ip().to_string();
+    let profile = lan_profile(
+        &arguments.profile,
+        NetplayRole::Client,
+        Some(peer),
+        candidate.game_port,
+    )?;
+    let plan = runtime::prepare(&profile, arguments.game)?;
+    let selected = select_compatible(
+        &sessions,
+        &plan.session_contract,
+        arguments.session_id.as_deref(),
+        now_unix_ms(),
+    )?;
+    let profile = lan_profile(
+        &arguments.profile,
+        NetplayRole::Client,
+        Some(selected.source.ip().to_string()),
+        selected.game_port,
+    )?;
+    let plan = runtime::prepare(&profile, arguments.game)?;
+    crate::netplay::require_agreement(&plan.session_contract, &selected.contract)?;
+    if json || arguments.dry_run {
+        emit(
+            &serde_json::json!({ "session": selected, "launch": &plan }),
+            json,
+            |value| {
+                println!("session: {}", value["session"]["session_id"]);
+                println!("command: {}", plan.arguments.join(" "));
+            },
+        )?;
+    }
+    if arguments.dry_run {
+        return Ok(());
+    }
+    let status = runtime::launch(&plan)?;
+    if !status.success() {
+        bail!("runtime exited with {status}");
+    }
     Ok(())
 }
 
@@ -444,6 +711,19 @@ where
         human(value);
     }
     Ok(())
+}
+
+fn refreshed_advertisement(
+    base: &DiscoveryPacket,
+    now_ms: u64,
+    ttl_ms: u64,
+    reconnect_ms: u64,
+) -> DiscoveryPacket {
+    let mut advertisement = base.clone();
+    advertisement.sent_at_unix_ms = now_ms;
+    advertisement.expires_at_unix_ms = now_ms.saturating_add(ttl_ms);
+    advertisement.reconnect_until_unix_ms = now_ms.saturating_add(reconnect_ms);
+    advertisement
 }
 
 #[cfg(test)]
@@ -471,5 +751,49 @@ mod tests {
         let envelope: serde_json::Value = serde_json::from_str(&failure.json()).unwrap();
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error"]["code"], "invalid-cli");
+    }
+
+    #[test]
+    fn lan_help_describes_public_interface_fallback_truthfully() {
+        let help = Cli::try_parse_from(["metal-slug-classics", "lan", "doctor", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("Permit public-address interface use"));
+        assert!(help.contains("automatic fallback"));
+    }
+
+    #[test]
+    fn refreshed_advertisement_keeps_invariant_fields_unchanged() {
+        let base = new_packet(
+            "session-1".to_owned(),
+            crate::netplay::SessionContract {
+                protocol_version: 2,
+                game: "3".to_owned(),
+                manifest_id: "mslug3-modern".to_owned(),
+                manifest_content_sha256: "manifest".to_owned(),
+                runtime_compatibility_id: "runtime".to_owned(),
+                core_compatibility_id: Some("core".to_owned()),
+                rom_sha256: "rom".to_owned(),
+                bios_sha256: "bios".to_owned(),
+                behavior_sha256: "behavior".to_owned(),
+            },
+            DEFAULT_GAME_PORT,
+            1_000_000,
+            Duration::from_millis(2_000),
+            Duration::from_secs(120),
+        );
+        let refreshed = refreshed_advertisement(&base, 2_000_000, 4_000, 300_000);
+        assert_eq!(refreshed.magic, base.magic);
+        assert_eq!(refreshed.discovery_version, base.discovery_version);
+        assert_eq!(refreshed.session_id, base.session_id);
+        assert_eq!(refreshed.started_at_unix_ms, base.started_at_unix_ms);
+        assert_eq!(refreshed.game_port, base.game_port);
+        assert_eq!(refreshed.contract, base.contract);
+        assert_eq!(base.sent_at_unix_ms, 1_000_000);
+        assert_eq!(base.expires_at_unix_ms, 1_002_000);
+        assert_eq!(base.reconnect_until_unix_ms, 1_120_000);
+        assert_eq!(refreshed.sent_at_unix_ms, 2_000_000);
+        assert_eq!(refreshed.expires_at_unix_ms, 2_004_000);
+        assert_eq!(refreshed.reconnect_until_unix_ms, 2_300_000);
     }
 }

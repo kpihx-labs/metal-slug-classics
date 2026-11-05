@@ -9,7 +9,11 @@
   profile storage and isolated save/state paths are implemented).
 - [ ] Build and pin the custom FBNeo libretro core plus a minimal governed
   RetroArch runtime (launcher contract is implemented).
-- [ ] Add discovery, latency diagnostics, disconnect/reconnect tests, and
-  two-physical-PC validation (strict zero-service behavioral agreement with
-  cross-platform compatibility IDs is implemented).
+- [x] Add zero-service same-subnet UDP broadcast/multicast discovery and strict
+  RetroArch/FBNeo host/join orchestration with stale filtering, configurable
+  interfaces/ports, and reconnect session metadata.
+- [ ] Add latency diagnostics, automated live disconnect/reconnect coverage,
+  full-game completion, and two-physical-PC Linux/Windows validation. Current
+  tests cover packet/reconnect metadata and exact prelaunch contracts/arguments,
+  not a real two-machine RetroArch session.
 - Cross-pollinate authentic/free presets, level selection, profiles, snapshots, replays, and controller contracts with KOF Wing and Blur.

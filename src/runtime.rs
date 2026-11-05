@@ -2,8 +2,12 @@ use crate::audit::{
     ArchiveAudit, AuditClass, AuditReport, BiosAudit, audit_bios, audit_path, sha256_file,
 };
 use crate::manifest::{GameId, SetManifest, manifests};
-use crate::netplay::{SessionContract, load as load_contract, require_agreement};
-use crate::profile::{NetplayRole, Profile, RuntimeKind, config_root, portable_path};
+use crate::netplay::{
+    SessionContract, load as load_contract, require_agreement, retroarch_netplay_arguments,
+};
+#[cfg(test)]
+use crate::profile::NetplayRole;
+use crate::profile::{Profile, RuntimeKind, config_root, portable_path};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -275,7 +279,7 @@ fn prepare_libretro(
         .parent()
         .ok_or_else(|| anyhow!("BIOS archive has no parent directory"))?;
     let config = format!(
-        "libretro_directory = \"{}\"\nsystem_directory = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\n",
+        "libretro_directory = \"{}\"\nsystem_directory = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
         portable_path(core.parent().unwrap_or_else(|| Path::new("."))),
         portable_path(system_directory),
         portable_path(&save_directory),
@@ -287,21 +291,15 @@ fn prepare_libretro(
         portable_path(&config_path),
         "-L".to_owned(),
         portable_path(&core),
-        portable_path(archive),
     ];
     if profile.netplay.enabled {
-        match profile.netplay.role {
-            NetplayRole::Host => arguments.push("--host".to_owned()),
-            NetplayRole::Client => {
-                let peer =
-                    profile.netplay.peer_address.as_ref().ok_or_else(|| {
-                        anyhow!("client netplay role requires netplay.peer_address")
-                    })?;
-                arguments.extend(["--connect".to_owned(), peer.clone()]);
-            }
-        }
-        arguments.extend(["--port".to_owned(), profile.netplay.port.to_string()]);
+        arguments.extend(retroarch_netplay_arguments(
+            profile.netplay.role,
+            profile.netplay.peer_address.as_deref(),
+            profile.netplay.port,
+        )?);
     }
+    arguments.push(portable_path(archive));
     Ok(PreparedRuntime {
         program: program.clone(),
         arguments,
@@ -485,21 +483,36 @@ mod tests {
         )
         .unwrap();
         let config = fs::read_to_string(&prepared.config_path).unwrap();
-        assert!(config.contains(&format!(
-            "system_directory = \"{}\"",
-            portable_path(bios.parent().unwrap())
-        )));
-        assert!(
-            prepared
-                .arguments
-                .windows(2)
-                .any(|pair| pair == ["--connect", "192.0.2.20"])
+        assert_eq!(
+            config,
+            format!(
+                "libretro_directory = \"{}\"\nsystem_directory = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
+                portable_path(
+                    profile
+                        .libretro_core
+                        .as_deref()
+                        .unwrap()
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                ),
+                portable_path(bios.parent().unwrap()),
+                portable_path(&directory.path().join("generated/saves")),
+                portable_path(&directory.path().join("generated/states")),
+            )
         );
-        assert!(
-            prepared
-                .arguments
-                .windows(2)
-                .any(|pair| pair == ["--port", "55440"])
+        assert_eq!(
+            prepared.arguments,
+            [
+                "--config".to_owned(),
+                portable_path(&prepared.config_path),
+                "-L".to_owned(),
+                portable_path(profile.libretro_core.as_deref().unwrap()),
+                "--connect".to_owned(),
+                "192.0.2.20".to_owned(),
+                "--port".to_owned(),
+                "55440".to_owned(),
+                portable_path(&archive),
+            ]
         );
         assert!(prepared.local_integrity.core_sha256.is_some());
     }
@@ -539,6 +552,34 @@ mod tests {
         verify_local_integrity(&profile, &prepared.local_integrity).unwrap();
         profile.expected_runtime_sha256 = Some("0".repeat(64));
         assert!(verify_local_integrity(&profile, &prepared.local_integrity).is_err());
+    }
+
+    #[test]
+    fn macos_standalone_uses_application_support_config_root() {
+        let directory = tempdir().unwrap();
+        let mut profile = Profile::new("macos", directory.path().join("roms")).unwrap();
+        profile.runtime = RuntimeKind::Standalone;
+        profile.runtime_compatibility_id = "fbneo-standalone-driver-abi-v1".to_owned();
+        let executable = directory.path().join("fbneo");
+        let bios = directory.path().join("bios/neogeo.zip");
+        file(&executable, b"synthetic macos executable");
+        file(&bios, b"synthetic bios placeholder");
+        profile.standalone_executable = Some(executable);
+        profile.expected_runtime_sha256 =
+            Some(sha256_file(profile.standalone_executable.as_deref().unwrap()).unwrap());
+        let generated = directory.path().join("generated");
+
+        let prepared =
+            prepare_standalone_for_os(&profile, "mslug", &bios, &generated, "macos").unwrap();
+        assert_eq!(
+            prepared.config_path,
+            generated.join("standalone-data/Library/Application Support/fbneo/config/fbneo.ini")
+        );
+        assert_eq!(
+            prepared.environment.get("HOME"),
+            Some(&portable_path(&generated.join("standalone-data")))
+        );
+        verify_local_integrity(&profile, &prepared.local_integrity).unwrap();
     }
 
     #[test]
@@ -597,17 +638,32 @@ mod tests {
             &client_root.path().join("generated"),
         )
         .unwrap();
-        assert!(
-            host_runtime
-                .arguments
-                .iter()
-                .any(|argument| argument == "--host")
+        assert_eq!(
+            host_runtime.arguments,
+            [
+                "--config".to_owned(),
+                portable_path(&host_runtime.config_path),
+                "-L".to_owned(),
+                portable_path(host.libretro_core.as_deref().unwrap()),
+                "--host".to_owned(),
+                "--port".to_owned(),
+                "55435".to_owned(),
+                portable_path(&host_archive),
+            ]
         );
-        assert!(
-            client_runtime
-                .arguments
-                .iter()
-                .any(|argument| argument == "--connect")
+        assert_eq!(
+            client_runtime.arguments,
+            [
+                "--config".to_owned(),
+                portable_path(&client_runtime.config_path),
+                "-L".to_owned(),
+                portable_path(client.libretro_core.as_deref().unwrap()),
+                "--connect".to_owned(),
+                "192.0.2.30".to_owned(),
+                "--port".to_owned(),
+                "60001".to_owned(),
+                portable_path(&client_archive),
+            ]
         );
         assert_ne!(
             host_runtime.local_integrity.runtime_sha256,

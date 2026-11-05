@@ -30,8 +30,15 @@ metal-slug-classics audit [path]
 metal-slug-classics play <1|2|x|3|4|5> [--profile NAME]
 metal-slug-classics profile list
 metal-slug-classics profile create NAME [OPTIONS]
-metal-slug-classics lan doctor
+metal-slug-classics lan doctor [LAN DISCOVERY OPTIONS]
+metal-slug-classics lan discover [LAN DISCOVERY OPTIONS] [--timeout-ms MS]
+metal-slug-classics lan host <1|2|x|3|4|5> [--profile NAME] [LAN DISCOVERY OPTIONS] [--game-port PORT] [--advertisement-ttl-ms MS] [--reconnect-seconds SEC]
+metal-slug-classics lan join <1|2|x|3|4|5> [--profile NAME] [LAN DISCOVERY OPTIONS] [--timeout-ms MS] [--session-id ID]
 ```
+
+`LAN DISCOVERY OPTIONS` are `--interface ADDRESS` (repeatable),
+`--discovery-port PORT`, `--multicast-address ADDRESS`, and
+`--allow-public-lan`.
 
 Add `--json` to any command for machine-readable output. Failures use the
 stable envelope `{"ok":false,"error":{"code":"…","message":"…"}}` and a
@@ -71,8 +78,8 @@ contracts:
    (including Windows), governed ROM/BIOS paths, joystick support, and autosave.
 2. **Custom FBNeo libretro core + RetroArch**: explicit executable/core paths,
    isolated saves/states, the exact audited BIOS directory bound as RetroArch's
-   `system_directory`, public netplay announcement disabled, and direct LAN
-   host/connect arguments.
+   `system_directory`, public netplay announcement/NAT traversal/MITM relay
+   disabled, and direct LAN host/connect arguments.
 
 The archive must already have the canonical driver filename named in the audit
 plan before launch. This project does not normalize payload bytes itself.
@@ -87,10 +94,35 @@ hash. Machine-local paths, native executable hashes, host/client role, peer
 address, and port are deliberately excluded from peer agreement. This lets a
 Linux host and Windows client agree while each still verifies its own binaries.
 
-When netplay is enabled, launch is blocked unless the peer contract supplied by
+The `lan` commands need no service, cloud account, public announcement, VPN,
+port forwarding, or firewall mutation. A host advertises a bounded JSON packet
+over same-subnet UDP broadcast and administratively scoped multicast (TTL 1).
+Discovery listens briefly, ignores malformed and stale packets, and accepts
+only source addresses that match a subnet represented by the selected local
+interfaces, while preserving explicit loopback selection. Automatic local
+interface selection prefers private/link-local IPv4 LAN addresses and falls
+back to opted-in public IPv4 addresses and finally loopback only when no LAN
+address is available; repeat `--interface` to select exact local IPv4
+addresses, including loopback. `--discovery-port`, `--multicast-address`, and
+`--game-port` override the defaults. Public-address interface use, including
+automatic fallback, requires the explicit `--allow-public-lan` opt-in.
+
+`lan host` prepares an exact RetroArch launch with `--host --port` before the
+single content archive, advertises its
+behavioral contract while RetroArch runs, and includes a stable session ID plus
+timestamps for reconnect selection. `lan join` can use `--session-id` to select
+that session, rebuilds and verifies its own local contract, rejects any game,
+manifest/profile, ROM, BIOS, runtime, or core mismatch, then launches with exact
+`--connect ADDRESS --port PORT` arguments before the single content archive.
+Advertisements contain no ROM/BIOS, filesystem paths, executable paths, or
+native binary hashes. Use `--dry-run` to
+inspect a prepared launch without advertising or starting RetroArch.
+
+The lower-level governed `play` path remains strict: when a profile enables
+netplay and requires a peer contract, launch is blocked unless the contract in
 `METAL_SLUG_PEER_CONTRACT` agrees on every behavioral field. `lan doctor` can
-compare `METAL_SLUG_LOCAL_CONTRACT` and `METAL_SLUG_PEER_CONTRACT` before either
-peer starts RetroArch.
+also compare `METAL_SLUG_LOCAL_CONTRACT` and `METAL_SLUG_PEER_CONTRACT` while
+checking usable local interfaces.
 
 The project doctor also requires the pinned Linux/Windows runtime archives,
 their exact SHA-256 hashes, and the pinned local FBNeo/MAME executables. Missing

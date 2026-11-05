@@ -19,6 +19,11 @@
 - Add canonical typed-manifest and behavioral-profile hashes, cross-platform
   runtime/core compatibility IDs, enforced local binary SHA-256 pins, and strict
   LAN agreement that excludes machine paths and host/client locator fields.
+- Add same-subnet UDP broadcast/multicast LAN discovery, exact RetroArch
+  `--host --port` and `--connect ADDRESS --port PORT` orchestration, bounded
+  stale-session filtering, reconnect session metadata, multi-interface
+  selection that prefers LAN adapters over loopback, and private-address
+  defaults with explicit public-interface opt-in.
 - Add stable JSON failure envelopes and strict pinned archive/executable doctor
   gates.
 - Add synthetic ZIP, CRC metadata, profile path, runtime, and netplay tests plus
