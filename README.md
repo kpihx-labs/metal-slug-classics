@@ -29,7 +29,7 @@ checks, and the project doctor. Test ZIPs contain only synthetic bytes.
 ```text
 metal-slug-classics doctor
 metal-slug-classics audit [path]
-metal-slug-classics normalize <ZIP_OR_DIRECTORY> --output <DIRECTORY> [--force]
+metal-slug-classics normalize <ZIP_OR_DIRECTORY> --output <DIRECTORY> [--force] [--skip-blocked]
 metal-slug-classics play <1|2|x|3|4|5> [--profile NAME]
 metal-slug-classics profile list
 metal-slug-classics profile create NAME [OPTIONS]
@@ -67,9 +67,12 @@ hash-addressed **derived-manifest plan** describing canonical member names and
 the required FBNeo driver. Auditing itself does not read member payloads.
 
 `normalize` accepts one explicit ZIP or all recognized collection ZIPs directly
-inside a directory. A valid sibling `neogeo.zip` remains required: the command
-refuses `missing-bios`, `corrupt`, `unknown`, blocked, incomplete, duplicate, or
-unsafe plans before publication. It performs rename-only materialization: every
+inside a directory. Complete ROM payloads may be normalized without a BIOS;
+their provenance explicitly records `bios_required: true`, while launch remains
+blocked until a valid sibling `neogeo.zip` is supplied. By default the command
+refuses any corrupt, unknown, blocked, incomplete, duplicate, or unsafe plan.
+`--skip-blocked` publishes complete sets atomically and reports every rejected
+archive and classification. It performs rename-only materialization: every
 source member is streamed byte-for-byte, with actual size and CRC32 checked
 against the selected manifest, while extra members are omitted. Output is an
 explicit directory outside the source location; the source is never modified.
@@ -78,7 +81,7 @@ Each archive is named from the selected manifest's real driver (for example
 `mslug4nrx.zip`), stores members in manifest order under manifest names, and
 uses a fixed ZIP timestamp, fixed permissions, and the deterministic `stored`
 method. An adjacent `<driver>.zip.provenance.json` records the stable source
-SHA-256 (not a machine-local path), manifest ID, every source-to-target name
+SHA-256 (not a machine-local path), manifest ID, BIOS requirement, every source-to-target name
 with CRC32/size, and output SHA-256. Equal source bytes therefore produce
 byte-identical provenance from different locations. The complete output
 directory is staged next to its destination, files are synchronized, directory

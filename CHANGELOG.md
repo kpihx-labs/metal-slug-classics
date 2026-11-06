@@ -14,6 +14,10 @@
   games, including explicit corrupt and missing-BIOS diagnostics.
 - Add deterministic blocked/ready derived-manifest plans without synthesizing
   ROM data.
+- Separate safe ROM normalization from BIOS availability: complete sets carry
+  `bios_required` provenance while launch remains blocked without a valid BIOS.
+- Add explicit `--skip-blocked` collection normalization with payload checksum
+  preflight and stable reporting for every omitted archive.
 - Add native profile paths, isolated standalone FBNeo working/config paths, and
   exact audited-BIOS binding for standalone and libretro/RetroArch runtimes.
 - Add canonical typed-manifest and behavioral-profile hashes, cross-platform
