@@ -180,6 +180,7 @@ pub fn manifests() -> Vec<SetManifest> {
         mslug3_legacy(),
         mslug4_modern(),
         mslug4_legacy(),
+        mslug4_neoragex(),
         mslug5_modern(),
         mslug5_legacy(),
     ]
@@ -279,6 +280,31 @@ fn mslug4_legacy() -> SetManifest {
             rom("263-m1.m1", 0x02_0000, 0x46ac_8228),
             rom("263-v1.v1", 0x80_0000, 0x01e9_b9cd),
             rom("263-v2.v2", 0x80_0000, 0x4ab2_bf81),
+        ],
+    }
+}
+
+fn mslug4_neoragex() -> SetManifest {
+    SetManifest {
+        id: "mslug4-neoragex-fully-decrypted",
+        game: GameId::Four,
+        driver: "mslug4-neoragex",
+        layout: LayoutKind::DocumentedLegacyDecrypted,
+        members: vec![
+            rom("263-p1d.bin", 0x10_0000, 0x4d7e_6624),
+            rom("263-p2d.bin", 0x40_0000, 0xfdb7_aed8),
+            rom("263-s1d.bin", 0x02_0000, 0xa944_6774),
+            rom("263-m1d.bin", 0x02_0000, 0xee1e_5580),
+            rom("263-v1d.bin", 0x40_0000, 0xc1b2_af81),
+            rom("263-v2d.bin", 0x40_0000, 0xcbbd_c6fa),
+            rom("263-v3d.bin", 0x40_0000, 0xc4f1_a3cc),
+            rom("263-v4d.bin", 0x40_0000, 0x4012_6a0a),
+            rom("263-c1d.bin", 0x80_0000, 0x361d_dda6),
+            rom("263-c2d.bin", 0x80_0000, 0x15d1_92c4),
+            rom("263-c3d.bin", 0x80_0000, 0x63fb_79ff),
+            rom("263-c4d.bin", 0x80_0000, 0xe862_3126),
+            rom("263-c5d.bin", 0x40_0000, 0x3348_dc5d),
+            rom("263-c6d.bin", 0x40_0000, 0xd90f_c1a0),
         ],
     }
 }
