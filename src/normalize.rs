@@ -6,7 +6,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, sink};
 use std::path::{Component, Path, PathBuf};
 use tempfile::{Builder, TempDir};
 use zip::write::SimpleFileOptions;
@@ -23,6 +23,7 @@ pub struct ProvenanceMember {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProvenanceManifest {
     pub schema_version: u8,
+    pub bios_required: bool,
     pub source_sha256: String,
     pub manifest_id: String,
     pub members: Vec<ProvenanceMember>,
@@ -41,6 +42,13 @@ pub struct NormalizedArchive {
 pub struct NormalizeReport {
     pub output: PathBuf,
     pub archives: Vec<NormalizedArchive>,
+    pub skipped: Vec<SkippedArchive>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkippedArchive {
+    pub archive: PathBuf,
+    pub classification: AuditClass,
 }
 
 struct ReadyArchive<'a> {
@@ -68,7 +76,12 @@ struct PathIdentity {
 /// # Errors
 /// Returns an error for unsafe paths, non-ready audits, payload mismatches, I/O
 /// failures, or an existing output when `force` is false.
-pub fn normalize_path(source: &Path, output: &Path, force: bool) -> Result<NormalizeReport> {
+pub fn normalize_path(
+    source: &Path,
+    output: &Path,
+    force: bool,
+    skip_blocked: bool,
+) -> Result<NormalizeReport> {
     let source = validate_source(source)?;
     let output = resolve_output(&source, output)?;
     let original_output = inspect_output(&output)?;
@@ -84,7 +97,22 @@ pub fn normalize_path(source: &Path, output: &Path, force: bool) -> Result<Norma
         "source contains no auditable game ZIP"
     );
     let known = manifests();
-    let ready = prepare_archives(&audit.archives, &known)?;
+    let (ready, mut skipped) = prepare_archives(&audit.archives, &known, skip_blocked)?;
+    let mut verified = Vec::with_capacity(ready.len());
+    for archive in ready {
+        match verify_payloads(&archive) {
+            Ok(()) => verified.push(archive),
+            Err(_error) if skip_blocked => skipped.push(SkippedArchive {
+                archive: archive.source,
+                classification: AuditClass::Corrupt,
+            }),
+            Err(error) => return Err(error),
+        }
+    }
+    ensure!(
+        !verified.is_empty(),
+        "source contains no normalizable game ZIP"
+    );
     let parent = output
         .parent()
         .ok_or_else(|| anyhow!("output must have a parent directory"))?;
@@ -97,8 +125,8 @@ pub fn normalize_path(source: &Path, output: &Path, force: bool) -> Result<Norma
         .prefix(".normalize-stage-")
         .tempdir_in(parent)?;
     let parent_identity = path_identity(&fs::symlink_metadata(parent)?);
-    let mut normalized = Vec::with_capacity(ready.len());
-    for archive in ready {
+    let mut normalized = Vec::with_capacity(verified.len());
+    for archive in verified {
         normalized.push(materialize(&archive, stage.path())?);
     }
     sync_directory(stage.path())?;
@@ -125,7 +153,32 @@ pub fn normalize_path(source: &Path, output: &Path, force: bool) -> Result<Norma
     Ok(NormalizeReport {
         output,
         archives: normalized,
+        skipped,
     })
+}
+
+fn verify_payloads(ready: &ReadyArchive<'_>) -> Result<()> {
+    let file = File::open(&ready.source)
+        .with_context(|| format!("open source archive {}", ready.source.display()))?;
+    let mut archive = ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("parse source archive {}", ready.source.display()))?;
+    for member in &ready.members {
+        let mut entry = archive.by_name(&member.source_name).with_context(|| {
+            format!(
+                "open member {} from {}",
+                member.source_name,
+                ready.source.display()
+            )
+        })?;
+        std::io::copy(&mut entry, &mut sink()).with_context(|| {
+            format!(
+                "verify member {} from {}",
+                member.source_name,
+                ready.source.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_source(source: &Path) -> Result<PathBuf> {
@@ -179,8 +232,10 @@ fn resolve_output(source: &Path, output: &Path) -> Result<PathBuf> {
 fn prepare_archives<'a>(
     archives: &[crate::audit::ArchiveAudit],
     manifests: &'a [SetManifest],
-) -> Result<Vec<ReadyArchive<'a>>> {
+    skip_blocked: bool,
+) -> Result<(Vec<ReadyArchive<'a>>, Vec<SkippedArchive>)> {
     let mut ready = Vec::with_capacity(archives.len());
+    let mut skipped = Vec::new();
     let mut targets = BTreeSet::new();
     for archive in archives {
         let metadata = fs::symlink_metadata(&archive.path)?;
@@ -189,15 +244,25 @@ fn prepare_archives<'a>(
             "source archive cannot be a symlink: {}",
             archive.path.display()
         );
-        ensure!(
-            matches!(
-                archive.classification,
-                AuditClass::ModernCompatible | AuditClass::DocumentedLegacyDecrypted
-            ),
-            "refusing {:?} archive {}",
+        if !matches!(
             archive.classification,
-            archive.path.display()
-        );
+            AuditClass::ModernCompatible
+                | AuditClass::DocumentedLegacyDecrypted
+                | AuditClass::MissingBios
+        ) {
+            if skip_blocked {
+                skipped.push(SkippedArchive {
+                    archive: archive.path.clone(),
+                    classification: archive.classification,
+                });
+                continue;
+            }
+            bail!(
+                "refusing {:?} archive {}",
+                archive.classification,
+                archive.path.display()
+            );
+        }
         let manifest_id = archive
             .manifest_id
             .as_deref()
@@ -231,7 +296,7 @@ fn prepare_archives<'a>(
             members,
         });
     }
-    Ok(ready)
+    Ok((ready, skipped))
 }
 
 fn plan_members(
@@ -420,7 +485,8 @@ fn materialize(ready: &ReadyArchive<'_>, output: &Path) -> Result<NormalizedArch
     ensure_open_file_is_current(&ready.source, &opened_identity)?;
     let output_sha256 = sha256_file(&archive_path)?;
     let provenance = ProvenanceManifest {
-        schema_version: 2,
+        schema_version: 3,
+        bios_required: true,
         source_sha256: ready.source_sha256.clone(),
         manifest_id: ready.manifest.id.to_owned(),
         members: ready.members.clone(),

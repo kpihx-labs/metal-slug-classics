@@ -249,7 +249,8 @@ fn normalizes_immutably_and_deterministically_with_provenance() {
     );
     let provenance_path = output_a.join("mslug.zip.provenance.json");
     let provenance: Value = serde_json::from_slice(&read_all(&provenance_path)).unwrap();
-    assert_eq!(provenance["schema_version"], 2);
+    assert_eq!(provenance["schema_version"], 3);
+    assert_eq!(provenance["bios_required"], true);
     assert!(provenance.get("source_path").is_none());
     assert_eq!(provenance["manifest_id"], "mslug-modern");
     assert_eq!(provenance["source_sha256"], source_before);
@@ -305,7 +306,7 @@ fn normalizes_immutably_and_deterministically_with_provenance() {
 }
 
 #[test]
-fn refuses_incomplete_corrupt_unknown_and_missing_bios_inputs() {
+fn refuses_damaged_and_unknown_inputs_but_normalizes_complete_roms_without_bios() {
     let temporary = tempfile::tempdir().unwrap();
     let manifest = fixture_manifest();
 
@@ -365,12 +366,45 @@ fn refuses_incomplete_corrupt_unknown_and_missing_bios_inputs() {
     fs::create_dir(&no_bios).unwrap();
     write_game(&no_bios.join("mslug-complete.zip"), &manifest, false, false);
     let no_bios_output = temporary.path().join("no-bios-output");
+    let no_bios_result = run_with_flags(&no_bios, &no_bios_output, &[]);
     assert!(
-        !run_with_flags(&no_bios, &no_bios_output, &[])
-            .status
-            .success()
+        no_bios_result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&no_bios_result.stderr)
     );
-    assert!(!no_bios_output.exists());
+    let provenance: Value =
+        serde_json::from_slice(&read_all(&no_bios_output.join("mslug.zip.provenance.json")))
+            .unwrap();
+    assert_eq!(provenance["bios_required"], true);
+}
+
+#[test]
+fn skip_blocked_reports_corrupt_sets_and_publishes_complete_sets() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("collection");
+    fs::create_dir(&source).unwrap();
+    let manifest = fixture_manifest();
+    write_game(&source.join("mslug-complete.zip"), &manifest, false, false);
+    let incomplete = manifest.members[..2]
+        .iter()
+        .map(|member| {
+            (
+                member.name.to_owned(),
+                bytes_with_crc(member.size, member.crc32),
+            )
+        })
+        .collect::<Vec<_>>();
+    write_zip(&source.join("mslug-incomplete.zip"), &incomplete);
+    let output = temporary.path().join("normalized");
+
+    let result = run_with_flags(&source, &output, &["--skip-blocked"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.join("mslug.zip").is_file());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("skipped"));
 }
 
 #[test]

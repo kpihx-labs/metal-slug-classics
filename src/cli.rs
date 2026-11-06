@@ -52,6 +52,11 @@ enum Command {
         output: PathBuf,
         #[arg(long, help = "Atomically replace an existing output directory")]
         force: bool,
+        #[arg(
+            long,
+            help = "Report and skip incomplete/corrupt archives in a collection"
+        )]
+        skip_blocked: bool,
     },
     Play {
         game: GameId,
@@ -558,7 +563,8 @@ where
             source,
             output,
             force,
-        } => normalize(&source, &output, force, cli.json)
+            skip_blocked,
+        } => normalize(&source, &output, force, skip_blocked, cli.json)
             .map_err(|error| command_failure("normalize-failed", &error)),
         Command::Play {
             game,
@@ -638,9 +644,10 @@ fn normalize(
     source: &std::path::Path,
     output: &std::path::Path,
     force: bool,
+    skip_blocked: bool,
     json: bool,
 ) -> Result<()> {
-    let report = normalize_path(source, output, force)?;
+    let report = normalize_path(source, output, force, skip_blocked)?;
     emit(&report, json, print_normalize)
 }
 
@@ -654,6 +661,13 @@ fn print_normalize(report: &NormalizeReport) {
             archive.output_sha256
         );
         println!("    provenance: {}", archive.provenance.display());
+    }
+    for skipped in &report.skipped {
+        println!(
+            "  skipped {} ({:?})",
+            skipped.archive.display(),
+            skipped.classification
+        );
     }
 }
 
