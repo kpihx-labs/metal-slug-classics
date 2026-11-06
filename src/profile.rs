@@ -1,4 +1,5 @@
 use crate::controls::ControlsConfig;
+use crate::language::{LanguageConfig, validate_region_system};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,6 +68,8 @@ pub struct Profile {
     pub system: String,
     pub authentic_slowdown: bool,
     #[serde(default)]
+    pub language: LanguageConfig,
+    #[serde(default)]
     pub controls: ControlsConfig,
     pub netplay: NetplaySettings,
 }
@@ -93,6 +96,7 @@ impl Profile {
             region: "auto".to_owned(),
             system: "mvs".to_owned(),
             authentic_slowdown: true,
+            language: LanguageConfig::default(),
             controls: ControlsConfig::default(),
             netplay: NetplaySettings::default(),
         })
@@ -125,13 +129,14 @@ impl Profile {
             RuntimeKind::Libretro => self.core_compatibility_id.as_deref(),
         };
         let canonical = serde_json::to_vec(&(
-            3_u32,
+            4_u32,
             self.runtime,
             &self.runtime_compatibility_id,
             core_compatibility_id,
             &self.region,
             &self.system,
             self.authentic_slowdown,
+            &self.language,
             self.controls.canonical(),
         ))
         .context("serialize behavioral profile")?;
@@ -203,6 +208,8 @@ pub fn profile_path(name: &str) -> Result<PathBuf> {
 /// Returns an error for invalid data or any directory/file write failure.
 pub fn create(profile: &Profile) -> Result<PathBuf> {
     validate_name(&profile.name)?;
+    profile.language.validate()?;
+    validate_region_system(&profile.region, &profile.system)?;
     let directory = profiles_dir()?;
     fs::create_dir_all(&directory)
         .with_context(|| format!("create profile directory {}", directory.display()))?;
@@ -229,6 +236,8 @@ pub fn create(profile: &Profile) -> Result<PathBuf> {
 /// Returns an error for invalid names, missing profiles, or write failures.
 pub fn replace(profile: &Profile) -> Result<PathBuf> {
     validate_name(&profile.name)?;
+    profile.language.validate()?;
+    validate_region_system(&profile.region, &profile.system)?;
     let path = profile_path(&profile.name)?;
     if !path.is_file() {
         bail!("profile does not exist: {}", path.display());
@@ -269,6 +278,8 @@ pub fn load(name: &str) -> Result<Profile> {
     let profile: Profile = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse profile {}", path.display()))?;
     validate_name(&profile.name)?;
+    profile.language.validate()?;
+    validate_region_system(&profile.region, &profile.system)?;
     if profile.name != name {
         bail!(
             "profile file/name mismatch: requested '{name}', contains '{}'",
@@ -370,6 +381,28 @@ mod tests {
     }
 
     #[test]
+    fn historical_profile_without_language_deserializes_to_english_and_reserializes_it() {
+        let profile = Profile::new("legacy", PathBuf::from("roms")).unwrap();
+        let mut value = serde_json::to_value(&profile).unwrap();
+        value.as_object_mut().unwrap().remove("language");
+
+        let migrated: Profile = serde_json::from_value(value).unwrap();
+        assert_eq!(migrated.language, LanguageConfig::default());
+        assert_eq!(
+            serde_json::to_value(migrated).unwrap()["language"]["locale"],
+            "en"
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_and_unavailable_region_system_values() {
+        assert!(validate_region_system("Europe", "mvs").is_err());
+        assert!(validate_region_system("europe", "MVS").is_err());
+        assert!(validate_region_system("usa", "aes").is_err());
+        assert!(validate_region_system("usa", "mvs").is_ok());
+    }
+
+    #[test]
     fn behavioral_hash_excludes_paths_and_netplay_locator_role() {
         let mut host = Profile::new("host", PathBuf::from("/linux/roms")).unwrap();
         host.bios_archive = PathBuf::from("/linux/bios/neogeo.zip");
@@ -446,6 +479,27 @@ mod tests {
                 fbneo_code: None,
             },
         );
+        assert_ne!(
+            client.behavior_sha256().unwrap(),
+            changed.behavior_sha256().unwrap()
+        );
+
+        let mut changed = client.clone();
+        changed.language.locale = "fr".to_owned();
+        assert_ne!(
+            client.behavior_sha256().unwrap(),
+            changed.behavior_sha256().unwrap()
+        );
+
+        let mut changed = client.clone();
+        changed.language.translation_pack_sha256 = Some("a".repeat(64));
+        assert_ne!(
+            client.behavior_sha256().unwrap(),
+            changed.behavior_sha256().unwrap()
+        );
+
+        let mut changed = client.clone();
+        changed.region = "usa".to_owned();
         assert_ne!(
             client.behavior_sha256().unwrap(),
             changed.behavior_sha256().unwrap()

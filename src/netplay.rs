@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const DEFAULT_DISCOVERY_PORT: u16 = 55_434;
 pub const DEFAULT_GAME_PORT: u16 = 55_435;
 pub const DEFAULT_MULTICAST_ADDRESS: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
+pub const SESSION_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_PACKET_BYTES: usize = 16_384;
 const DISCOVERY_MAGIC: &str = "metal-slug-classics-lan";
 const DISCOVERY_VERSION: u32 = 1;
@@ -27,6 +28,8 @@ pub struct SessionContract {
     pub core_compatibility_id: Option<String>,
     pub rom_sha256: String,
     pub bios_sha256: String,
+    pub language: String,
+    pub region: String,
     pub behavior_sha256: String,
 }
 
@@ -569,6 +572,18 @@ pub fn compare(local: &SessionContract, peer: &SessionContract) -> AgreementRepo
     );
     compare_field(
         &mut mismatches,
+        "language",
+        local.language.clone(),
+        peer.language.clone(),
+    );
+    compare_field(
+        &mut mismatches,
+        "region",
+        local.region.clone(),
+        peer.region.clone(),
+    );
+    compare_field(
+        &mut mismatches,
         "behavior_sha256",
         local.behavior_sha256.clone(),
         peer.behavior_sha256.clone(),
@@ -644,7 +659,7 @@ mod tests {
 
     fn contract() -> SessionContract {
         SessionContract {
-            protocol_version: 1,
+            protocol_version: SESSION_PROTOCOL_VERSION,
             game: "3".to_owned(),
             manifest_id: "mslug3-modern".to_owned(),
             manifest_content_sha256: "manifest-content".to_owned(),
@@ -652,6 +667,8 @@ mod tests {
             core_compatibility_id: Some("fbneo-custom-v1".to_owned()),
             rom_sha256: "rom".to_owned(),
             bios_sha256: "bios".to_owned(),
+            language: "en".to_owned(),
+            region: "europe".to_owned(),
             behavior_sha256: "behavior".to_owned(),
         }
     }
@@ -672,6 +689,30 @@ mod tests {
         assert!(!report.agreed);
         assert_eq!(report.mismatches[0].field, "bios_sha256");
         assert!(require_agreement(&local, &peer).is_err());
+    }
+
+    #[test]
+    fn language_and_region_mismatches_block_prelaunch_explicitly() {
+        let local = contract();
+        let mut peer = contract();
+        peer.language = "fr".to_owned();
+        peer.region = "usa".to_owned();
+        let fields = compare(&local, &peer)
+            .mismatches
+            .into_iter()
+            .map(|mismatch| mismatch.field)
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["language", "region"]);
+    }
+
+    #[test]
+    fn protocol_v2_cannot_agree_with_protocol_v3() {
+        let local = contract();
+        let mut peer = contract();
+        peer.protocol_version = 2;
+        let report = compare(&local, &peer);
+        assert_eq!(report.mismatches.len(), 1);
+        assert_eq!(report.mismatches[0].field, "protocol_version");
     }
 
     #[test]

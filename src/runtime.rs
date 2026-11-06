@@ -1,9 +1,11 @@
 use crate::audit::{
     ArchiveAudit, AuditClass, AuditReport, BiosAudit, audit_bios, audit_path, sha256_file,
 };
+use crate::language::validate_region_system;
 use crate::manifest::{GameId, SetManifest, manifests};
 use crate::netplay::{
-    SessionContract, load as load_contract, require_agreement, retroarch_netplay_arguments,
+    SESSION_PROTOCOL_VERSION, SessionContract, load as load_contract, require_agreement,
+    retroarch_netplay_arguments,
 };
 #[cfg(test)]
 use crate::profile::NetplayRole;
@@ -54,6 +56,9 @@ pub fn prepare(profile: &Profile, game: GameId) -> Result<LaunchPlan> {
     let report = audit_path(&profile.rom_directory)?;
     let bios = audit_bios(&profile.bios_archive)?;
     validate_bios(&bios)?;
+    if profile.runtime == RuntimeKind::Libretro {
+        validate_bios_mode(&bios, neogeo_mode(profile)?)?;
+    }
     let archive = select_archive(&report, profile, game)?;
     let manifest = manifest_for_archive(archive)?;
     let stem = archive
@@ -128,6 +133,19 @@ fn validate_bios(bios: &BiosAudit) -> Result<()> {
         bail!(
             "FBNeo BIOS archive must be named neogeo.zip: {}",
             bios.path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_bios_mode(bios: &BiosAudit, mode: &str) -> Result<()> {
+    if !bios
+        .available_neogeo_modes
+        .iter()
+        .any(|available| available == mode)
+    {
+        bail!(
+            "verified Neo Geo BIOS does not contain the requested {mode} system BIOS; FBNeo would fall back to DIPSWITCH"
         );
     }
     Ok(())
@@ -212,6 +230,12 @@ fn prepare_standalone_for_os(
     generated: &Path,
     os: &str,
 ) -> Result<PreparedRuntime> {
+    profile.language.validate()?;
+    if profile.region != "auto" || profile.system != "mvs" {
+        bail!(
+            "standalone FBNeo cannot guarantee an isolated Neo Geo region/system override; use libretro or region=auto/system=mvs"
+        );
+    }
     if os == "windows" {
         bail!(
             "standalone FBNeo on Windows changes its working directory to the executable directory, so an isolated generated configuration cannot be guaranteed; use the libretro runtime"
@@ -278,12 +302,14 @@ fn prepare_libretro(
     bios_archive: &Path,
     generated: &Path,
 ) -> Result<PreparedRuntime> {
+    profile.language.validate()?;
     let program = required_file(
         profile.retroarch_executable.as_deref(),
         "retroarch_executable",
     )?;
     let core = required_file(profile.libretro_core.as_deref(), "libretro_core")?;
     let config_path = generated.join("retroarch.cfg");
+    let core_options_path = generated.join("retroarch-core-options.cfg");
     let working_directory = generated.join("retroarch-work");
     let save_directory = generated.join("saves");
     let state_directory = generated.join("states");
@@ -301,8 +327,13 @@ fn prepare_libretro(
     let system_directory = retroarch_path_value(system_directory, "system directory")?;
     let save_directory_value = retroarch_path_value(&save_directory, "save directory")?;
     let state_directory_value = retroarch_path_value(&state_directory, "state directory")?;
+    let core_options_path_value = retroarch_path_value(&core_options_path, "core options path")?;
+    atomic_write(
+        &core_options_path,
+        format!("fbneo-neogeo-mode = \"{}\"\n", neogeo_mode(profile)?).as_bytes(),
+    )?;
     let config = format!(
-        "config_save_on_exit = \"false\"\ninput_autodetect_enable = \"false\"\nlibretro_directory = \"{core_directory}\"\nsystem_directory = \"{system_directory}\"\nsavefile_directory = \"{save_directory_value}\"\nsavestate_directory = \"{state_directory_value}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
+        "config_save_on_exit = \"false\"\ninput_autodetect_enable = \"false\"\nlibretro_directory = \"{core_directory}\"\nsystem_directory = \"{system_directory}\"\nsavefile_directory = \"{save_directory_value}\"\nsavestate_directory = \"{state_directory_value}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\ncore_options_path = \"{core_options_path_value}\"\n",
     );
     atomic_write(&config_path, format!("{config}{input_config}").as_bytes())?;
     let mut arguments = vec![
@@ -330,6 +361,18 @@ fn prepare_libretro(
             core_sha256: Some(sha256_file(&core)?),
         },
     })
+}
+
+fn neogeo_mode(profile: &Profile) -> Result<&'static str> {
+    validate_region_system(&profile.region, &profile.system)?;
+    match (profile.system.as_str(), profile.region.as_str()) {
+        ("mvs", "auto" | "europe" | "asia") => Ok("MVS_EUR"),
+        ("mvs", "usa") => Ok("MVS_USA"),
+        ("mvs", "japan") => Ok("MVS_JAP"),
+        ("aes", "auto" | "europe" | "asia") => Ok("AES_EUR"),
+        ("aes", "japan") => Ok("AES_JAP"),
+        _ => unreachable!("validated above"),
+    }
 }
 
 fn validate_compatibility_ids(profile: &Profile) -> Result<()> {
@@ -399,7 +442,7 @@ fn build_session_contract(
 ) -> Result<SessionContract> {
     validate_compatibility_ids(profile)?;
     Ok(SessionContract {
-        protocol_version: 2,
+        protocol_version: SESSION_PROTOCOL_VERSION,
         game: game.to_string(),
         manifest_id: manifest.id.to_owned(),
         manifest_content_sha256: manifest.content_sha256()?,
@@ -410,6 +453,8 @@ fn build_session_contract(
         },
         rom_sha256,
         bios_sha256,
+        language: profile.language.locale.clone(),
+        region: profile.region.clone(),
         behavior_sha256: profile.behavior_sha256()?,
     })
 }
@@ -577,6 +622,13 @@ mod tests {
             )));
         assert!(config.contains("input_player1_up = \"w\""));
         assert!(config.contains("input_player2_select = \"num0\""));
+        let core_options = fs::read_to_string(
+            directory
+                .path()
+                .join("generated/retroarch-core-options.cfg"),
+        )
+        .unwrap();
+        assert_eq!(core_options, "fbneo-neogeo-mode = \"MVS_EUR\"\n");
         assert_eq!(
             prepared.arguments,
             [
@@ -657,6 +709,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_aes_usa_instead_of_silently_substituting_europe() {
+        let mut profile = Profile::new("aes-usa", PathBuf::from("roms")).unwrap();
+        profile.system = "aes".to_owned();
+        profile.region = "usa".to_owned();
+        assert!(neogeo_mode(&profile).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_requested_bios_mode_before_fbneo_can_fallback() {
+        let bios = BiosAudit {
+            path: PathBuf::from("neogeo.zip"),
+            archive_sha256: "0".repeat(64),
+            valid: true,
+            available_neogeo_modes: vec!["MVS_EUR".to_owned()],
+            error: None,
+        };
+        validate_bios_mode(&bios, "MVS_EUR").unwrap();
+        let error = validate_bios_mode(&bios, "MVS_USA")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fall back to DIPSWITCH"));
+    }
+
+    #[test]
     fn macos_standalone_uses_application_support_config_root() {
         let directory = tempdir().unwrap();
         let mut profile = Profile::new("macos", directory.path().join("roms")).unwrap();
@@ -726,6 +802,9 @@ mod tests {
         )
         .unwrap();
         assert!(compare(&host_contract, &client_contract).agreed);
+        assert_eq!(host_contract.protocol_version, SESSION_PROTOCOL_VERSION);
+        assert_eq!(host_contract.language, "en");
+        assert_eq!(host_contract.region, "auto");
 
         let host_runtime = prepare_libretro(
             &host,

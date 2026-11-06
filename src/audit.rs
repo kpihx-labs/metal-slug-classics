@@ -89,6 +89,7 @@ pub struct BiosAudit {
     pub path: PathBuf,
     pub archive_sha256: String,
     pub valid: bool,
+    pub available_neogeo_modes: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -166,16 +167,24 @@ pub fn audit_bios(path: &Path) -> Result<BiosAudit> {
         .with_context(|| format!("resolve BIOS archive {}", path.display()))?;
     let archive_sha256 = sha256_file(&exact_path)?;
     match inspect_zip(&exact_path) {
-        Ok(members) => Ok(BiosAudit {
-            path: exact_path,
-            archive_sha256,
-            valid: valid_bios(&members),
-            error: None,
-        }),
+        Ok(members) => {
+            let available_neogeo_modes = available_neogeo_modes(&members)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            Ok(BiosAudit {
+                path: exact_path,
+                archive_sha256,
+                valid: valid_bios(&members),
+                available_neogeo_modes,
+                error: None,
+            })
+        }
         Err(error) => Ok(BiosAudit {
             path: exact_path,
             archive_sha256,
             valid: false,
+            available_neogeo_modes: Vec::new(),
             error: Some(error.to_string()),
         }),
     }
@@ -494,6 +503,52 @@ fn valid_bios(members: &[ZipMember]) -> bool {
         })
 }
 
+fn available_neogeo_modes(members: &[ZipMember]) -> Vec<&'static str> {
+    const MODES: &[(&str, &[(u64, u32)])] = &[
+        (
+            "MVS_EUR",
+            &[
+                (0x02_0000, 0x91b6_4be3),
+                (0x02_0000, 0x9036_d879),
+                (0x02_0000, 0xc7f2_fa45),
+                (0x08_0000, 0x03cc_9f6a),
+            ],
+        ),
+        (
+            "MVS_USA",
+            &[
+                (0x02_0000, 0xe729_43de),
+                (0x02_0000, 0x62f0_21f4),
+                (0x02_0000, 0x2723_a5b5),
+                (0x02_0000, 0x1179_a30f),
+                (0x02_0000, 0x2025_b7a2),
+            ],
+        ),
+        (
+            "MVS_JAP",
+            &[
+                (0x02_0000, 0xf0e8_f27d),
+                (0x02_0000, 0xaced_e59c),
+                (0x02_0000, 0x9fb0_abe4),
+                (0x08_0000, 0x486c_b450),
+                (0x02_0000, 0xdff6_d41f),
+                (0x02_0000, 0xfbc6_d469),
+            ],
+        ),
+        ("AES_EUR", &[(0x02_0000, 0xd27a_71f1)]),
+        ("AES_JAP", &[(0x02_0000, 0x16d0_c132)]),
+    ];
+    MODES
+        .iter()
+        .filter_map(|(mode, signatures)| {
+            members
+                .iter()
+                .any(|member| signatures.contains(&(member.size, member.crc32)))
+                .then_some(*mode)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +687,7 @@ mod tests {
             },
         ];
         assert!(valid_bios(&members));
+        assert_eq!(available_neogeo_modes(&members), ["MVS_EUR"]);
         members.pop();
         assert!(!valid_bios(&members));
     }

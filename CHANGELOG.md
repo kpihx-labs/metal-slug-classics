@@ -58,3 +58,30 @@
   netplay behavioral hash and add unit, simulated runtime, hash, physical
   conflict, replacement round-trip, and end-to-end CLI coverage. Physical
   two-machine play/reconnect/completion validation remains a release task.
+- Add a versioned per-profile language contract and `language
+  list/show/set/validate/import/export` with complete, key-parity English and
+  French launcher catalogues, strict one-step English fallback, bounded imports,
+  and synchronized same-directory replacement.
+- Add `language pack generate/validate/apply/revert` for deterministic,
+  reversible byte-manifest patches derived exclusively from operator-owned
+  files under `work/`; require 100% operator-declared coverage, equal sizes,
+  exact base and result SHA-256, bounded non-overlapping reversible hunks, no
+  complete literal payload, no symlinks, no out-of-work paths, no clobbering,
+  and atomic publication.
+- Include language and region explicitly in netplay protocol v3 and in the
+  behavioral profile hash so a mismatch blocks launch before peer connection.
+- Generate an isolated RetroArch core-options file and set the pinned FBNeo
+  `fbneo-neogeo-mode` to authentic MVS/AES Europe/USA/Japan values selected by
+  the profile; reject missing requested BIOS modes before the core can fall back
+  to `DIPSWITCH`, and reject standalone region/system overrides that cannot be
+  proven isolated.
+- Add unit and CLI integration tests for catalogue coverage/fallback, profile
+  migration, language import atomicity, language/region hashing, exact core
+  options, deterministic reversible packs, wrong-base/incomplete/out-of-work
+  rejection, no partial outputs, and native Linux/Windows/macOS profile paths.
+- Refuse AES USA instead of silently substituting AES Europe: the pinned FBNeo
+  core exposes USA only for MVS, while AES exposes Europe/Asia and Japan.
+- Bound translation inputs, manifest bytes, hunk size/count, and cumulative
+  patch bytes; reject traversal before creating output parents and test
+  symlink, complete-payload, oversized-input, wrong-hash, apply, and revert
+  failures without partial publication.

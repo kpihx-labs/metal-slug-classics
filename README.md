@@ -228,3 +228,91 @@ remains an independent preservation oracle.
 Build the exact pinned Linux core with `make build-core`, the Windows core with
 `make build-core-windows`, or both with `make build-cores`. Generated cores and
 SHA-256 manifests live under `work/cores/<platform>/` and remain outside Git.
+
+## Languages and reversible translation infrastructure
+
+Language is a versioned part of every profile. Existing profiles without a
+language field deserialize as schema 1 English and persist that object on their
+next successful replacement; merely reading a profile does not rewrite it. New
+profiles accept `--language en|fr`, `--region
+auto|europe|asia|usa|japan`, and `--system mvs|aes`.
+
+```text
+metal-slug-classics language list
+metal-slug-classics language show [PROFILE]
+metal-slug-classics language set [PROFILE] --locale en|fr [--region REGION] [--system mvs|aes]
+metal-slug-classics language validate [PROFILE] [--input LANGUAGE.json]
+metal-slug-classics language import LANGUAGE.json [--profile PROFILE]
+metal-slug-classics language export LANGUAGE.json [--profile PROFILE]
+metal-slug-classics language pack generate BASE TRANSLATED --output PACK.json --game GAME --locale fr [--coverage 100]
+metal-slug-classics language pack validate PACK.json
+metal-slug-classics language pack apply PACK.json BASE --output TRANSLATED
+metal-slug-classics language pack revert PACK.json TRANSLATED --output BASE
+```
+
+The built-in English and French launcher catalogues have exactly the same key
+set and report 100% launcher-catalogue coverage. Fallback is strict and
+one-step: French may fall back only to the complete English source catalogue;
+unknown locale or message keys are errors. This percentage describes the
+governed catalogue's key parity, **not translation of every CLI diagnostic and
+not the text inside a game**. Imported language tags must be canonical,
+well-formed BCP 47; only `en` and `fr` are currently supported.
+
+For libretro profiles the launcher writes an isolated
+`retroarch-core-options.cfg`, points RetroArch to it with `core_options_path`,
+and selects FBNeo's real `fbneo-neogeo-mode`: `MVS_EUR`, `MVS_USA`, `MVS_JAP`,
+`AES_EUR`, or `AES_JAP` according to profile system/region. The pinned core
+documents Europe/Asia and USA as English and Japan as Japanese; it has no
+French Neo Geo BIOS mode. Before launch, central-directory CRC/size metadata
+must match a known BIOS signature for the requested mode; otherwise the
+launcher refuses the run instead of allowing FBNeo's internal `DIPSWITCH`
+fallback. The exact archive SHA-256 is then linked into the LAN contract.
+Libretro `region=auto` selects the Europe/Asia mode for the chosen
+MVS/AES system. Standalone SDL FBNeo is restricted to
+`region=auto, system=mvs`, where its authentic BIOS/DIP default remains in
+control, rather than pretending an isolated override was consumed.
+
+French in-game support is **infrastructure only today**. The `coverage_percent`
+field is an operator declaration that must equal 100; structural validation
+cannot prove linguistic completeness. A concrete translated title is complete
+only after independent review of its output. No such claim follows merely from
+selecting the French launcher locale. A profile may record the canonical
+SHA-256 identity of a structurally validated pack, but the ordinary ROM auditor
+still rejects unknown or modified sets: adding a translated runtime manifest
+is a separate preservation review, not an implicit bypass.
+
+Translation packs use `reversible-byte-manifest-v1`, a transparent manifest of
+offset plus exact before/after bytes. `generate` derives every byte by comparing
+two equal-size operator-supplied files; it never authors, downloads, repairs, or
+guesses ROM data. All ROM inputs and generated/applied outputs must be regular,
+non-symlink files under `work/` (or `METAL_SLUG_WORK`). The pack itself contains
+no complete ROM: generation and validation reject a manifest that represents
+every input byte. Inputs are capped at 64 MiB, manifests at 16 MiB, each hunk at
+64 KiB, the hunk count at 16,384, and total changed bytes at 2 MiB. Generation
+refuses a declared coverage other than 100%; validation rejects unknown fields,
+malformed hashes, empty/unchanged/overlapping/out-of-range hunks, and limit
+violations. Apply/revert require the exact input SHA-256 and verify every
+expected byte plus the final SHA-256 before a synchronized, same-directory,
+no-clobber publication. Wrong bases and existing outputs remain untouched.
+Callers must not concurrently replace paths inside the governed work tree;
+portable standard-library path checks cannot make adversarial path replacement
+races impossible on every supported operating system.
+
+Netplay contract protocol 3 includes `language` and `region` as explicit fields,
+and the versioned language object, region, and system also feed the behavioral
+profile hash. The translated ROM archive hash remains independently mandatory.
+Peers with different launcher language, region, pack identity, ROM, BIOS, core,
+or runtime behavior cannot agree.
+
+FBNeo source inspection for the pinned libretro gitlink found the relevant
+option in `src/burner/libretro/retro_common.cpp`: the core exposes the five
+authentic MVS/AES modes above plus `DIPSWITCH` and `UNIBIOS`, checks BIOS
+availability, and can fall back internally to the BIOS DIP when a requested BIOS
+is absent. This launcher intentionally does not select `UNIBIOS`, does not use
+dynamic IPS core options, and preflights mode availability so that internal
+fallback is rejected rather than treated as proof of the requested region.
+Physical-runtime validation remains a release task.
+
+The pinned option set has no AES USA value. `system=aes, region=usa` is rejected
+instead of being silently mapped to AES Europe; USA is available authentically
+through `system=mvs, region=usa`.

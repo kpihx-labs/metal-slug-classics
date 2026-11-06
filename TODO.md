@@ -24,3 +24,16 @@
   tests cover packet/reconnect metadata and exact prelaunch contracts/arguments,
   not a real two-machine RetroArch session.
 - Cross-pollinate authentic/free presets, level selection, profiles, snapshots, replays, and controller contracts with KOF Wing and Blur.
+- [x] Add versioned per-profile language selection, strict EN/FR launcher
+  catalogues, bounded atomic language import/export, and language/region
+  netplay agreement.
+- [x] Bind authentic Neo Geo region/system choices to the pinned FBNeo libretro
+  `fbneo-neogeo-mode` core option and reject unsupported standalone overrides.
+- [x] Add deterministic reversible translation-pack manifests generated and
+  applied only under `work/`, with 100% coverage, exact base/result SHA-256,
+  no-clobber atomic publication, and apply/revert tests.
+- [ ] Produce and independently review a lawful French in-game pack for each
+  title. Until every title reaches verified 100% coverage, French in-game
+  support remains infrastructure only and must not be advertised as complete.
+- [ ] Validate generated core-options files against physical Linux/Windows
+  RetroArch builds and every available authentic MVS/AES region BIOS.

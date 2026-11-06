@@ -2,6 +2,7 @@ use crate::audit::{ArchiveAudit, AuditReport, MemberState, audit_path};
 use crate::controls::{
     self, ControlsConfig, ControlsPreset, DeviceKind, InputBinding, MappingUpdate,
 };
+use crate::language::{self, LanguageConfig};
 use crate::manifest::{GameId, manifests};
 use crate::netplay::{
     AgreementReport, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, DEFAULT_MULTICAST_ADDRESS,
@@ -67,6 +68,10 @@ enum Command {
         #[command(subcommand)]
         command: ControlsCommand,
     },
+    Language {
+        #[command(subcommand)]
+        command: LanguageCommand,
+    },
     Lan {
         #[command(subcommand)]
         command: LanCommand,
@@ -83,6 +88,57 @@ enum RuntimeArgument {
 enum ControlsPresetArgument {
     Authentic,
     Modern,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LanguageArgument {
+    En,
+    Fr,
+}
+
+impl LanguageArgument {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Fr => "fr",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RegionArgument {
+    Auto,
+    Europe,
+    Asia,
+    Usa,
+    Japan,
+}
+
+impl RegionArgument {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Europe => "europe",
+            Self::Asia => "asia",
+            Self::Usa => "usa",
+            Self::Japan => "japan",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SystemArgument {
+    Mvs,
+    Aes,
+}
+
+impl SystemArgument {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mvs => "mvs",
+            Self::Aes => "aes",
+        }
+    }
 }
 
 impl From<ControlsPresetArgument> for ControlsPreset {
@@ -151,6 +207,12 @@ struct ProfileCreateArgs {
         help = "Install an explicit optional controls preset"
     )]
     controls_preset: Option<ControlsPresetArgument>,
+    #[arg(long, value_enum, default_value = "en")]
+    language: LanguageArgument,
+    #[arg(long, value_enum, default_value = "auto")]
+    region: RegionArgument,
+    #[arg(long, value_enum, default_value = "mvs")]
+    system: SystemArgument,
 }
 
 #[derive(Debug, Subcommand)]
@@ -227,6 +289,99 @@ struct ControlsValidateArgs {
         help = "Validate an exported controls JSON file instead of the profile"
     )]
     input: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum LanguageCommand {
+    List,
+    Show(LanguageProfileArgs),
+    Set(LanguageSetArgs),
+    Import(LanguageImportArgs),
+    Export(LanguageExportArgs),
+    Validate(LanguageValidateArgs),
+    Pack {
+        #[command(subcommand)]
+        command: TranslationPackCommand,
+    },
+}
+
+#[derive(Debug, Args)]
+struct LanguageProfileArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+}
+
+#[derive(Debug, Args)]
+struct LanguageSetArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+    #[arg(long, value_enum)]
+    locale: LanguageArgument,
+    #[arg(long, value_enum)]
+    region: Option<RegionArgument>,
+    #[arg(long, value_enum)]
+    system: Option<SystemArgument>,
+    #[arg(long, conflicts_with = "clear_translation_pack")]
+    translation_pack: Option<PathBuf>,
+    #[arg(long)]
+    clear_translation_pack: bool,
+}
+
+#[derive(Debug, Args)]
+struct LanguageImportArgs {
+    input: PathBuf,
+    #[arg(long, default_value = "default")]
+    profile: String,
+}
+
+#[derive(Debug, Args)]
+struct LanguageExportArgs {
+    output: PathBuf,
+    #[arg(long, default_value = "default")]
+    profile: String,
+}
+
+#[derive(Debug, Args)]
+struct LanguageValidateArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+    #[arg(long)]
+    input: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum TranslationPackCommand {
+    Generate(TranslationPackGenerateArgs),
+    Validate(TranslationPackValidateArgs),
+    Apply(TranslationPackApplyArgs),
+    Revert(TranslationPackApplyArgs),
+}
+
+#[derive(Debug, Args)]
+struct TranslationPackGenerateArgs {
+    base: PathBuf,
+    translated: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    game: String,
+    #[arg(long, value_enum)]
+    locale: LanguageArgument,
+    #[arg(long, default_value_t = 100)]
+    coverage: u8,
+}
+
+#[derive(Debug, Args)]
+struct TranslationPackValidateArgs {
+    pack: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct TranslationPackApplyArgs {
+    pack: PathBuf,
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -415,6 +570,8 @@ where
             .map_err(|error| command_failure("profile-failed", &error)),
         Command::Controls { command } => controls_command(command, cli.json)
             .map_err(|error| command_failure("controls-failed", &error)),
+        Command::Language { command } => language_command(command, cli.json)
+            .map_err(|error| command_failure("language-failed", &error)),
         Command::Lan { command } => match command {
             LanCommand::Doctor(arguments) => lan_doctor(&arguments, cli.json)
                 .map_err(|error| command_failure("lan-doctor-failed", &error)),
@@ -556,13 +713,23 @@ fn print_archive(archive: &ArchiveAudit) {
 
 fn play(game: GameId, profile_name: &str, dry_run: bool, json: bool) -> Result<()> {
     let profile = profile::load(profile_name)?;
+    let locale = profile.language.locale.clone();
     let plan = runtime::prepare(&profile, game)?;
     if json || dry_run {
         emit(&plan, json, |value| {
-            println!("runtime: {}", value.program.display());
-            println!("contract: {}", value.contract_path.display());
             println!(
-                "command: {} {}",
+                "{}: {}",
+                language::message(&locale, "launcher.runtime").expect("catalogue key"),
+                value.program.display()
+            );
+            println!(
+                "{}: {}",
+                language::message(&locale, "launcher.contract").expect("catalogue key"),
+                value.contract_path.display()
+            );
+            println!(
+                "{}: {} {}",
+                language::message(&locale, "launcher.command").expect("catalogue key"),
                 value.program.display(),
                 value.arguments.join(" ")
             );
@@ -605,6 +772,9 @@ fn profile_command(command: ProfileCommand, json: bool) -> Result<()> {
                 runtime_sha256,
                 core_sha256,
                 controls_preset,
+                language: profile_language,
+                region,
+                system,
             } = *arguments;
             let mut value =
                 Profile::new(&name, rom_dir.unwrap_or(profile::default_rom_directory()?))?;
@@ -616,6 +786,13 @@ fn profile_command(command: ProfileCommand, json: bool) -> Result<()> {
             value.core_compatibility_id = core_compatibility_id;
             value.expected_runtime_sha256 = Some(runtime_sha256);
             value.expected_core_sha256 = core_sha256;
+            value.language = LanguageConfig {
+                locale: profile_language.as_str().to_owned(),
+                fallback_locale: language::fallback_for(profile_language.as_str()).to_owned(),
+                ..LanguageConfig::default()
+            };
+            region.as_str().clone_into(&mut value.region);
+            system.as_str().clone_into(&mut value.system);
             if let Some(preset) = controls_preset {
                 value.controls = ControlsConfig::preset(preset.into());
             }
@@ -726,6 +903,199 @@ fn emit_controls_result(controls: &ControlsConfig, path: &PathBuf, json: bool) -
             println!("draft is not launch-ready: {error}");
         }
     })
+}
+
+fn language_command(command: LanguageCommand, json: bool) -> Result<()> {
+    match command {
+        LanguageCommand::List => {
+            let reports = language::locale_reports();
+            emit(&reports, json, |values| {
+                for value in values {
+                    println!(
+                        "{}: launcher {}%, fallback={}, in-game={}",
+                        value.locale,
+                        value.launcher_coverage_percent,
+                        value.fallback_locale,
+                        value.in_game
+                    );
+                }
+            })
+        }
+        LanguageCommand::Show(arguments) => {
+            let profile = profile::load(&arguments.profile)?;
+            let report = serde_json::json!({
+                "language": profile.language,
+                "region": profile.region,
+                "system": profile.system,
+            });
+            emit(&report, json, |value| {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(value).expect("serialize language")
+                );
+            })
+        }
+        LanguageCommand::Set(arguments) => {
+            let mut profile = profile::load(&arguments.profile)?;
+            let locale = arguments.locale.as_str();
+            let translation_pack_sha256 = if let Some(path) = arguments.translation_pack {
+                let pack = language::load_pack(&path)?;
+                if pack.locale != locale {
+                    bail!(
+                        "translation pack locale '{}' does not match requested locale '{locale}'",
+                        pack.locale
+                    );
+                }
+                Some(pack.sha256()?)
+            } else if arguments.clear_translation_pack {
+                None
+            } else if profile.language.locale == locale {
+                profile.language.translation_pack_sha256.clone()
+            } else {
+                None
+            };
+            profile.language = LanguageConfig {
+                schema_version: language::LANGUAGE_SCHEMA_VERSION,
+                locale: locale.to_owned(),
+                fallback_locale: language::fallback_for(locale).to_owned(),
+                translation_pack_sha256,
+            };
+            if let Some(region) = arguments.region {
+                region.as_str().clone_into(&mut profile.region);
+            }
+            if let Some(system) = arguments.system {
+                system.as_str().clone_into(&mut profile.system);
+            }
+            profile.language.validate()?;
+            let path = profile::replace(&profile)?;
+            emit_language_result(&profile, &path, json, "language.updated")
+        }
+        LanguageCommand::Import(arguments) => {
+            let mut profile = profile::load(&arguments.profile)?;
+            profile.language = language::import(&arguments.input)?;
+            let path = profile::replace(&profile)?;
+            emit_language_result(&profile, &path, json, "language.updated")
+        }
+        LanguageCommand::Export(arguments) => {
+            let profile = profile::load(&arguments.profile)?;
+            let path = language::atomic_export(&arguments.output, &profile.language)?;
+            emit_language_result(&profile, &path, json, "language.exported")
+        }
+        LanguageCommand::Validate(arguments) => {
+            let value = if let Some(path) = arguments.input {
+                language::import(&path)?
+            } else {
+                profile::load(&arguments.profile)?.language
+            };
+            value.validate()?;
+            emit(
+                &serde_json::json!({
+                    "valid": true,
+                    "schema_version": value.schema_version,
+                    "locale": value.locale,
+                    "fallback_locale": value.fallback_locale,
+                }),
+                json,
+                |_| {
+                    println!(
+                        "{}",
+                        language::message(&value.locale, "language.valid").expect("catalogue key")
+                    );
+                },
+            )
+        }
+        LanguageCommand::Pack { command } => translation_pack_command(command, json),
+    }
+}
+
+fn emit_language_result(
+    profile: &Profile,
+    path: &std::path::Path,
+    json: bool,
+    message_key: &str,
+) -> Result<()> {
+    let report = serde_json::json!({
+        "path": path,
+        "language": profile.language,
+        "region": profile.region,
+        "system": profile.system,
+    });
+    emit(&report, json, |_| {
+        println!(
+            "{}: {}",
+            language::message(&profile.language.locale, message_key).expect("catalogue key"),
+            path.display()
+        );
+    })
+}
+
+fn translation_pack_command(command: TranslationPackCommand, json: bool) -> Result<()> {
+    match command {
+        TranslationPackCommand::Generate(arguments) => {
+            let pack = language::generate_pack(
+                &language::work_root(),
+                &arguments.base,
+                &arguments.translated,
+                &arguments.output,
+                &arguments.game,
+                arguments.locale.as_str(),
+                arguments.coverage,
+            )?;
+            emit(&pack, json, |value| {
+                println!(
+                    "translation pack generated: {} hunks, SHA-256 {}",
+                    value.hunks.len(),
+                    value.sha256().expect("validated pack")
+                );
+            })
+        }
+        TranslationPackCommand::Validate(arguments) => {
+            let pack = language::load_pack(&arguments.pack)?;
+            emit(
+                &serde_json::json!({
+                    "valid": true,
+                    "pack_sha256": pack.sha256()?,
+                    "base_sha256": pack.base_sha256,
+                    "translated_sha256": pack.translated_sha256,
+                    "coverage_percent": pack.coverage_percent,
+                }),
+                json,
+                |_| {
+                    println!(
+                        "translation pack is structurally valid; 100% coverage is operator-declared"
+                    );
+                },
+            )
+        }
+        TranslationPackCommand::Apply(arguments) => {
+            let hash = language::apply_pack(
+                &language::work_root(),
+                &arguments.pack,
+                &arguments.input,
+                &arguments.output,
+                false,
+            )?;
+            emit(
+                &serde_json::json!({ "output": arguments.output, "sha256": hash }),
+                json,
+                |value| println!("applied translation pack: SHA-256 {}", value["sha256"]),
+            )
+        }
+        TranslationPackCommand::Revert(arguments) => {
+            let hash = language::apply_pack(
+                &language::work_root(),
+                &arguments.pack,
+                &arguments.input,
+                &arguments.output,
+                true,
+            )?;
+            emit(
+                &serde_json::json!({ "output": arguments.output, "sha256": hash }),
+                json,
+                |value| println!("reverted translation pack: SHA-256 {}", value["sha256"]),
+            )
+        }
+    }
 }
 
 fn lan_doctor(arguments: &DiscoveryArgs, json: bool) -> Result<()> {
@@ -1022,7 +1392,7 @@ mod tests {
         let base = new_packet(
             "session-1".to_owned(),
             crate::netplay::SessionContract {
-                protocol_version: 2,
+                protocol_version: 3,
                 game: "3".to_owned(),
                 manifest_id: "mslug3-modern".to_owned(),
                 manifest_content_sha256: "manifest".to_owned(),
@@ -1030,6 +1400,8 @@ mod tests {
                 core_compatibility_id: Some("core".to_owned()),
                 rom_sha256: "rom".to_owned(),
                 bios_sha256: "bios".to_owned(),
+                language: "en".to_owned(),
+                region: "europe".to_owned(),
                 behavior_sha256: "behavior".to_owned(),
             },
             DEFAULT_GAME_PORT,
