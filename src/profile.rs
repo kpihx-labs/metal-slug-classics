@@ -1,8 +1,9 @@
+use crate::controls::ControlsConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +66,8 @@ pub struct Profile {
     pub region: String,
     pub system: String,
     pub authentic_slowdown: bool,
+    #[serde(default)]
+    pub controls: ControlsConfig,
     pub netplay: NetplaySettings,
 }
 
@@ -90,6 +93,7 @@ impl Profile {
             region: "auto".to_owned(),
             system: "mvs".to_owned(),
             authentic_slowdown: true,
+            controls: ControlsConfig::default(),
             netplay: NetplaySettings::default(),
         })
     }
@@ -121,13 +125,14 @@ impl Profile {
             RuntimeKind::Libretro => self.core_compatibility_id.as_deref(),
         };
         let canonical = serde_json::to_vec(&(
-            1_u32,
+            3_u32,
             self.runtime,
             &self.runtime_compatibility_id,
             core_compatibility_id,
             &self.region,
             &self.system,
             self.authentic_slowdown,
+            self.controls.canonical(),
         ))
         .context("serialize behavioral profile")?;
         Ok(format!("{:x}", Sha256::digest(canonical)))
@@ -202,15 +207,56 @@ pub fn create(profile: &Profile) -> Result<PathBuf> {
     fs::create_dir_all(&directory)
         .with_context(|| format!("create profile directory {}", directory.display()))?;
     let path = directory.join(format!("{}.json", profile.name));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("create profile {} (refusing to overwrite)", path.display()))?;
+    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
     let mut bytes = serde_json::to_vec_pretty(profile)?;
     bytes.push(b'\n');
     file.write_all(&bytes)?;
+    file.as_file().sync_all()?;
+    file.persist_noclobber(&path).map_err(|error| {
+        anyhow!(
+            "create profile {} (refusing to overwrite): {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    sync_directory(&directory)?;
     Ok(path)
+}
+
+/// Atomically replaces an existing profile through a same-directory temporary file.
+///
+/// # Errors
+/// Returns an error for invalid names, missing profiles, or write failures.
+pub fn replace(profile: &Profile) -> Result<PathBuf> {
+    validate_name(&profile.name)?;
+    let path = profile_path(&profile.name)?;
+    if !path.is_file() {
+        bail!("profile does not exist: {}", path.display());
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("profile path has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let mut bytes = serde_json::to_vec_pretty(profile)?;
+    bytes.push(b'\n');
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&path)
+        .map_err(|error| anyhow!("atomically replace {}: {}", path.display(), error.error))?;
+    sync_directory(directory)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Loads and validates a named profile.
@@ -353,6 +399,56 @@ mod tests {
         assert_eq!(
             host.behavior_sha256().unwrap(),
             client.behavior_sha256().unwrap()
+        );
+
+        client.controls =
+            crate::controls::ControlsConfig::preset(crate::controls::ControlsPreset::Modern);
+        let mapped_hash = client.behavior_sha256().unwrap();
+        client.controls.players.reverse();
+        assert_eq!(mapped_hash, client.behavior_sha256().unwrap());
+        assert_ne!(
+            host.behavior_sha256().unwrap(),
+            client.behavior_sha256().unwrap()
+        );
+
+        let original_hash = client.behavior_sha256().unwrap();
+        client.controls.players[0].devices[0].id = "machine-local-alias".to_owned();
+        assert_eq!(original_hash, client.behavior_sha256().unwrap());
+
+        let mut changed = client.clone();
+        changed.controls.players[0].devices[0].index = 1;
+        assert_ne!(
+            client.behavior_sha256().unwrap(),
+            changed.behavior_sha256().unwrap()
+        );
+
+        let mut changed = client.clone();
+        if let crate::controls::InputBinding::Key {
+            key, fbneo_code, ..
+        } = changed.controls.players[0].devices[0]
+            .actions
+            .get_mut(&crate::controls::GameAction::Fire1)
+            .unwrap()
+        {
+            *key = "different".to_owned();
+            *fbneo_code = Some(0x1234);
+        }
+        assert_ne!(
+            client.behavior_sha256().unwrap(),
+            changed.behavior_sha256().unwrap()
+        );
+
+        let mut changed = client.clone();
+        changed.controls.players[0].devices[0].hotkeys.insert(
+            crate::controls::HotkeyAction::PauseToggle,
+            crate::controls::InputBinding::Key {
+                key: "p".to_owned(),
+                fbneo_code: None,
+            },
+        );
+        assert_ne!(
+            client.behavior_sha256().unwrap(),
+            changed.behavior_sha256().unwrap()
         );
     }
 }

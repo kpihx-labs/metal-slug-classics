@@ -1,10 +1,14 @@
 use crate::audit::{ArchiveAudit, AuditReport, MemberState, audit_path};
+use crate::controls::{
+    self, ControlsConfig, ControlsPreset, DeviceKind, InputBinding, MappingUpdate,
+};
 use crate::manifest::{GameId, manifests};
 use crate::netplay::{
     AgreementReport, DEFAULT_DISCOVERY_PORT, DEFAULT_GAME_PORT, DEFAULT_MULTICAST_ADDRESS,
     DiscoveryOptions, DiscoveryPacket, advertise_once, compare, discover, load as load_contract,
     local_interfaces, new_packet, now_unix_ms, select_compatible,
 };
+use crate::normalize::{NormalizeReport, normalize_path};
 use crate::profile::{self, NetplayRole, Profile, RuntimeKind};
 use crate::runtime;
 use anyhow::{Result, bail};
@@ -37,6 +41,17 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    Normalize {
+        source: PathBuf,
+        #[arg(
+            long,
+            value_name = "DIRECTORY",
+            help = "Explicit output directory outside the source"
+        )]
+        output: PathBuf,
+        #[arg(long, help = "Atomically replace an existing output directory")]
+        force: bool,
+    },
     Play {
         game: GameId,
         #[arg(long, default_value = "default")]
@@ -48,6 +63,10 @@ enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    Controls {
+        #[command(subcommand)]
+        command: ControlsCommand,
+    },
     Lan {
         #[command(subcommand)]
         command: LanCommand,
@@ -58,6 +77,36 @@ enum Command {
 enum RuntimeArgument {
     Standalone,
     Libretro,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ControlsPresetArgument {
+    Authentic,
+    Modern,
+}
+
+impl From<ControlsPresetArgument> for ControlsPreset {
+    fn from(value: ControlsPresetArgument) -> Self {
+        match value {
+            ControlsPresetArgument::Authentic => Self::Authentic,
+            ControlsPresetArgument::Modern => Self::Modern,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DeviceKindArgument {
+    Keyboard,
+    Gamepad,
+}
+
+impl From<DeviceKindArgument> for DeviceKind {
+    fn from(value: DeviceKindArgument) -> Self {
+        match value {
+            DeviceKindArgument::Keyboard => Self::Keyboard,
+            DeviceKindArgument::Gamepad => Self::Gamepad,
+        }
+    }
 }
 
 impl From<RuntimeArgument> for RuntimeKind {
@@ -96,6 +145,88 @@ struct ProfileCreateArgs {
     runtime_sha256: String,
     #[arg(long)]
     core_sha256: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Install an explicit optional controls preset"
+    )]
+    controls_preset: Option<ControlsPresetArgument>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ControlsCommand {
+    Show(ControlsProfileArgs),
+    Set(ControlsSetArgs),
+    Reset(ControlsResetArgs),
+    Import(ControlsImportArgs),
+    Export(ControlsExportArgs),
+    Validate(ControlsValidateArgs),
+}
+
+#[derive(Debug, Args)]
+struct ControlsProfileArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+}
+
+#[derive(Debug, Args)]
+struct ControlsSetArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+    player: u8,
+    #[arg(long)]
+    device: String,
+    #[arg(long, value_enum)]
+    kind: DeviceKindArgument,
+    #[arg(long, default_value_t = 0)]
+    index: u8,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=950))]
+    deadzone: u16,
+    #[arg(long, help = "ACTION or hotkey.NAME")]
+    target: String,
+    #[arg(
+        long,
+        required_unless_present = "clear",
+        conflicts_with = "clear",
+        help = "key:NAME[:FBNEO_CODE], button:N, or axis:N:+|-:THRESHOLD"
+    )]
+    binding: Option<InputBinding>,
+    #[arg(long, help = "Remove the target mapping from this device")]
+    clear: bool,
+}
+
+#[derive(Debug, Args)]
+struct ControlsResetArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+    #[arg(long, value_enum)]
+    preset: Option<ControlsPresetArgument>,
+}
+
+#[derive(Debug, Args)]
+struct ControlsImportArgs {
+    input: PathBuf,
+    #[arg(long, default_value = "default")]
+    profile: String,
+}
+
+#[derive(Debug, Args)]
+struct ControlsExportArgs {
+    output: PathBuf,
+    #[arg(long, default_value = "default")]
+    profile: String,
+}
+
+#[derive(Debug, Args)]
+struct ControlsValidateArgs {
+    #[arg(default_value = "default")]
+    profile: String,
+    #[arg(
+        long,
+        help = "Validate an exported controls JSON file instead of the profile"
+    )]
+    input: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -268,6 +399,12 @@ where
         Command::Audit { path } => {
             audit(&path, cli.json).map_err(|error| command_failure("audit-failed", &error))
         }
+        Command::Normalize {
+            source,
+            output,
+            force,
+        } => normalize(&source, &output, force, cli.json)
+            .map_err(|error| command_failure("normalize-failed", &error)),
         Command::Play {
             game,
             profile,
@@ -276,6 +413,8 @@ where
             .map_err(|error| command_failure("play-failed", &error)),
         Command::Profile { command } => profile_command(command, cli.json)
             .map_err(|error| command_failure("profile-failed", &error)),
+        Command::Controls { command } => controls_command(command, cli.json)
+            .map_err(|error| command_failure("controls-failed", &error)),
         Command::Lan { command } => match command {
             LanCommand::Doctor(arguments) => lan_doctor(&arguments, cli.json)
                 .map_err(|error| command_failure("lan-doctor-failed", &error)),
@@ -336,6 +475,29 @@ fn doctor(json: bool) -> Result<()> {
 fn audit(path: &std::path::Path, json: bool) -> Result<()> {
     let report = audit_path(path)?;
     emit(&report, json, print_audit)
+}
+
+fn normalize(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    let report = normalize_path(source, output, force)?;
+    emit(&report, json, print_normalize)
+}
+
+fn print_normalize(report: &NormalizeReport) {
+    println!("Normalized output: {}", report.output.display());
+    for archive in &report.archives {
+        println!(
+            "  {} ({}, SHA-256 {})",
+            archive.archive.display(),
+            archive.manifest_id,
+            archive.output_sha256
+        );
+        println!("    provenance: {}", archive.provenance.display());
+    }
 }
 
 fn print_audit(report: &AuditReport) {
@@ -442,6 +604,7 @@ fn profile_command(command: ProfileCommand, json: bool) -> Result<()> {
                 core_compatibility_id,
                 runtime_sha256,
                 core_sha256,
+                controls_preset,
             } = *arguments;
             let mut value =
                 Profile::new(&name, rom_dir.unwrap_or(profile::default_rom_directory()?))?;
@@ -453,6 +616,9 @@ fn profile_command(command: ProfileCommand, json: bool) -> Result<()> {
             value.core_compatibility_id = core_compatibility_id;
             value.expected_runtime_sha256 = Some(runtime_sha256);
             value.expected_core_sha256 = core_sha256;
+            if let Some(preset) = controls_preset {
+                value.controls = ControlsConfig::preset(preset.into());
+            }
             if value.runtime == RuntimeKind::Libretro
                 && (value.core_compatibility_id.is_none() || value.expected_core_sha256.is_none())
             {
@@ -474,6 +640,92 @@ fn profile_command(command: ProfileCommand, json: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn controls_command(command: ControlsCommand, json: bool) -> Result<()> {
+    match command {
+        ControlsCommand::Show(arguments) => {
+            let value = profile::load(&arguments.profile)?.controls;
+            emit(&value, json, |controls| {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(controls).expect("serialize controls")
+                );
+            })
+        }
+        ControlsCommand::Set(arguments) => {
+            let mut value = profile::load(&arguments.profile)?;
+            if arguments.clear {
+                value
+                    .controls
+                    .clear(arguments.player, &arguments.device, &arguments.target)?;
+            } else {
+                value.controls.set(MappingUpdate {
+                    player: arguments.player,
+                    device_id: &arguments.device,
+                    kind: arguments.kind.into(),
+                    index: arguments.index,
+                    deadzone_per_mille: arguments.deadzone,
+                    target: &arguments.target,
+                    binding: arguments
+                        .binding
+                        .expect("clap requires binding unless --clear"),
+                })?;
+            }
+            let path = profile::replace(&value)?;
+            emit_controls_result(&value.controls, &path, json)
+        }
+        ControlsCommand::Reset(arguments) => {
+            let mut value = profile::load(&arguments.profile)?;
+            value.controls = arguments
+                .preset
+                .map_or_else(ControlsConfig::default, |preset| {
+                    ControlsConfig::preset(preset.into())
+                });
+            let path = profile::replace(&value)?;
+            emit_controls_result(&value.controls, &path, json)
+        }
+        ControlsCommand::Import(arguments) => {
+            let mut value = profile::load(&arguments.profile)?;
+            value.controls = controls::import(&arguments.input)?;
+            let path = profile::replace(&value)?;
+            emit_controls_result(&value.controls, &path, json)
+        }
+        ControlsCommand::Export(arguments) => {
+            let value = profile::load(&arguments.profile)?;
+            let path = controls::atomic_export(&arguments.output, &value.controls)?;
+            emit_controls_result(&value.controls, &path, json)
+        }
+        ControlsCommand::Validate(arguments) => {
+            let value = if let Some(path) = arguments.input {
+                controls::import(&path)?
+            } else {
+                profile::load(&arguments.profile)?.controls
+            };
+            value.validate()?;
+            emit(
+                &serde_json::json!({ "valid": true, "schema_version": value.schema_version }),
+                json,
+                |_| println!("controls are valid (schema {})", value.schema_version),
+            )
+        }
+    }
+}
+
+fn emit_controls_result(controls: &ControlsConfig, path: &PathBuf, json: bool) -> Result<()> {
+    let validation_error = controls.validate().err().map(|error| error.to_string());
+    let result = serde_json::json!({
+        "path": path,
+        "controls": controls,
+        "valid": validation_error.is_none(),
+        "validation_error": validation_error,
+    });
+    emit(&result, json, |value| {
+        println!("updated {}", value["path"].as_str().unwrap_or("controls"));
+        if let Some(error) = value["validation_error"].as_str() {
+            println!("draft is not launch-ready: {error}");
+        }
+    })
 }
 
 fn lan_doctor(arguments: &DiscoveryArgs, json: bool) -> Result<()> {

@@ -328,6 +328,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crc32fast",
  "if-addrs",
  "serde",
  "serde_json",

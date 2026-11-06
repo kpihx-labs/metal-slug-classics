@@ -288,7 +288,7 @@ fn mslug4_neoragex() -> SetManifest {
     SetManifest {
         id: "mslug4-neoragex-fully-decrypted",
         game: GameId::Four,
-        driver: "mslug4-neoragex",
+        driver: "mslug4nrx",
         layout: LayoutKind::DocumentedLegacyDecrypted,
         members: vec![
             rom("263-p1d.bin", 0x10_0000, 0x4d7e_6624),
@@ -394,6 +394,15 @@ mod tests {
                 assert_ne!(member.crc32, 0);
             }
         }
+    }
+
+    #[test]
+    fn neoragex_manifest_uses_the_real_fbneo_driver_name() {
+        let manifest = manifests()
+            .into_iter()
+            .find(|item| item.id == "mslug4-neoragex-fully-decrypted")
+            .unwrap();
+        assert_eq!(manifest.driver, "mslug4nrx");
     }
 
     #[test]

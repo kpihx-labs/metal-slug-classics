@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -211,6 +212,11 @@ fn prepare_standalone_for_os(
     generated: &Path,
     os: &str,
 ) -> Result<PreparedRuntime> {
+    if os == "windows" {
+        bail!(
+            "standalone FBNeo on Windows changes its working directory to the executable directory, so an isolated generated configuration cannot be guaranteed; use the libretro runtime"
+        );
+    }
     let program = required_file(
         profile.standalone_executable.as_deref(),
         "standalone_executable",
@@ -227,9 +233,18 @@ fn prepare_standalone_for_os(
         .parent()
         .ok_or_else(|| anyhow!("BIOS archive has no parent directory"))?;
     let bios_path = trailing_slash(&portable_path(bios_directory));
-    fs::write(
+    atomic_write(
         &config_path,
-        format!("szAppRomPaths[0] {rom_path}\nszAppRomPaths[1] {bios_path}\nEnableHiscores 1\n"),
+        format!("szAppRomPaths[0] {rom_path}\nszAppRomPaths[1] {bios_path}\nEnableHiscores 1\n")
+            .as_bytes(),
+    )?;
+    let game_config = working_directory
+        .join("config")
+        .join("games")
+        .join(format!("{driver}.ini"));
+    atomic_write(
+        &game_config,
+        profile.controls.fbneo_game_config()?.as_bytes(),
     )?;
     let mut environment = BTreeMap::new();
     match os {
@@ -278,14 +293,18 @@ fn prepare_libretro(
     let system_directory = bios_archive
         .parent()
         .ok_or_else(|| anyhow!("BIOS archive has no parent directory"))?;
+    let input_config = profile.controls.retroarch_config()?;
+    let core_directory = retroarch_path_value(
+        core.parent().unwrap_or_else(|| Path::new(".")),
+        "core directory",
+    )?;
+    let system_directory = retroarch_path_value(system_directory, "system directory")?;
+    let save_directory_value = retroarch_path_value(&save_directory, "save directory")?;
+    let state_directory_value = retroarch_path_value(&state_directory, "state directory")?;
     let config = format!(
-        "libretro_directory = \"{}\"\nsystem_directory = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
-        portable_path(core.parent().unwrap_or_else(|| Path::new("."))),
-        portable_path(system_directory),
-        portable_path(&save_directory),
-        portable_path(&state_directory),
+        "config_save_on_exit = \"false\"\ninput_autodetect_enable = \"false\"\nlibretro_directory = \"{core_directory}\"\nsystem_directory = \"{system_directory}\"\nsavefile_directory = \"{save_directory_value}\"\nsavestate_directory = \"{state_directory_value}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
     );
-    fs::write(&config_path, config)?;
+    atomic_write(&config_path, format!("{config}{input_config}").as_bytes())?;
     let mut arguments = vec![
         "--config".to_owned(),
         portable_path(&config_path),
@@ -420,15 +439,57 @@ fn trailing_slash(path: &str) -> String {
     }
 }
 
+fn retroarch_path_value(path: &Path, label: &str) -> Result<String> {
+    let value = portable_path(path);
+    if value
+        .chars()
+        .any(|character| matches!(character, '"' | '\n' | '\r' | '\0'))
+    {
+        bail!("RetroArch {label} contains a character its config syntax cannot encode safely");
+    }
+    Ok(value)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+    atomic_write(path, &bytes)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("output path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| {
+        anyhow!(
+            "atomically persist runtime configuration {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controls::{ControlsConfig, ControlsPreset, InputBinding};
     use crate::netplay::compare;
     use tempfile::tempdir;
 
@@ -453,8 +514,25 @@ mod tests {
             Some(sha256_file(profile.libretro_core.as_deref().unwrap()).unwrap());
         profile.runtime_compatibility_id = "retroarch-cross-platform-netplay-v1".to_owned();
         profile.core_compatibility_id = Some("fbneo-custom-driver-abi-v1".to_owned());
+        profile.controls = ControlsConfig::preset(ControlsPreset::Modern);
         profile.netplay.enabled = true;
         profile
+    }
+
+    fn standalone_controls() -> ControlsConfig {
+        let mut controls = ControlsConfig::preset(ControlsPreset::Modern);
+        let mut code = 1_u16;
+        for player in &mut controls.players {
+            for device in &mut player.devices {
+                for binding in device.actions.values_mut() {
+                    if let InputBinding::Key { fbneo_code, .. } = binding {
+                        *fbneo_code = Some(code);
+                        code += 1;
+                    }
+                }
+            }
+        }
+        controls
     }
 
     #[test]
@@ -483,10 +561,8 @@ mod tests {
         )
         .unwrap();
         let config = fs::read_to_string(&prepared.config_path).unwrap();
-        assert_eq!(
-            config,
-            format!(
-                "libretro_directory = \"{}\"\nsystem_directory = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
+        assert!(config.starts_with(&format!(
+                "config_save_on_exit = \"false\"\ninput_autodetect_enable = \"false\"\nlibretro_directory = \"{}\"\nsystem_directory = \"{}\"\nsavefile_directory = \"{}\"\nsavestate_directory = \"{}\"\nnetwork_cmd_enable = \"false\"\nnetplay_public_announce = \"false\"\nnetplay_nat_traversal = \"false\"\nnetplay_use_mitm_server = \"false\"\n",
                 portable_path(
                     profile
                         .libretro_core
@@ -498,8 +574,9 @@ mod tests {
                 portable_path(bios.parent().unwrap()),
                 portable_path(&directory.path().join("generated/saves")),
                 portable_path(&directory.path().join("generated/states")),
-            )
-        );
+            )));
+        assert!(config.contains("input_player1_up = \"w\""));
+        assert!(config.contains("input_player2_select = \"num0\""));
         assert_eq!(
             prepared.arguments,
             [
@@ -518,11 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn windows_standalone_uses_isolated_working_directory_config() {
+    fn windows_standalone_is_rejected_when_isolation_cannot_be_exact() {
         let directory = tempdir().unwrap();
         let mut profile = Profile::new("windows", directory.path().join("roms")).unwrap();
         profile.runtime = RuntimeKind::Standalone;
         profile.runtime_compatibility_id = "fbneo-standalone-driver-abi-v1".to_owned();
+        profile.controls = standalone_controls();
         let executable = directory.path().join("fbneo.exe");
         let bios = directory.path().join("bios/neogeo.zip");
         file(&executable, b"synthetic windows executable");
@@ -532,26 +610,50 @@ mod tests {
             Some(sha256_file(profile.standalone_executable.as_deref().unwrap()).unwrap());
         let generated = directory.path().join("generated");
 
+        let error = prepare_standalone_for_os(&profile, "mslug", &bios, &generated, "windows")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changes its working directory"));
+        assert!(!generated.exists());
+    }
+
+    #[test]
+    fn linux_standalone_writes_the_paths_consumed_by_sdl_fbneo() {
+        let directory = tempdir().unwrap();
+        let mut profile = Profile::new("linux", directory.path().join("roms")).unwrap();
+        profile.runtime = RuntimeKind::Standalone;
+        profile.runtime_compatibility_id = "fbneo-standalone-driver-abi-v1".to_owned();
+        profile.controls = standalone_controls();
+        let executable = directory.path().join("fbneo");
+        let bios = directory.path().join("bios/neogeo.zip");
+        file(&executable, b"synthetic linux executable");
+        file(&bios, b"synthetic bios placeholder");
+        profile.standalone_executable = Some(executable);
+        let generated = directory.path().join("generated");
+
         let prepared =
-            prepare_standalone_for_os(&profile, "mslug", &bios, &generated, "windows").unwrap();
-        assert_eq!(
-            prepared.working_directory,
-            generated.join("standalone-work")
-        );
+            prepare_standalone_for_os(&profile, "mslug", &bios, &generated, "linux").unwrap();
         assert_eq!(
             prepared.config_path,
-            prepared.working_directory.join("fbneo.ini")
+            generated.join("standalone-data/fbneo/config/fbneo.ini")
         );
         assert_eq!(
-            prepared.environment.get("APPDATA"),
+            prepared.environment.get("XDG_DATA_HOME"),
             Some(&portable_path(&generated.join("standalone-data")))
         );
-        let config = fs::read_to_string(&prepared.config_path).unwrap();
-        assert!(config.contains("szAppRomPaths[0]"));
-        assert!(config.contains("szAppRomPaths[1]"));
-        verify_local_integrity(&profile, &prepared.local_integrity).unwrap();
-        profile.expected_runtime_sha256 = Some("0".repeat(64));
-        assert!(verify_local_integrity(&profile, &prepared.local_integrity).is_err());
+        assert_eq!(prepared.arguments, ["-joy", "-autosave", "mslug"]);
+        assert!(
+            prepared
+                .working_directory
+                .join("config/games/mslug.ini")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn retroarch_rejects_unencodable_config_paths() {
+        let error = retroarch_path_value(Path::new("/tmp/bad\"path"), "test path").unwrap_err();
+        assert!(error.to_string().contains("cannot encode safely"));
     }
 
     #[test]
@@ -560,6 +662,7 @@ mod tests {
         let mut profile = Profile::new("macos", directory.path().join("roms")).unwrap();
         profile.runtime = RuntimeKind::Standalone;
         profile.runtime_compatibility_id = "fbneo-standalone-driver-abi-v1".to_owned();
+        profile.controls = standalone_controls();
         let executable = directory.path().join("fbneo");
         let bios = directory.path().join("bios/neogeo.zip");
         file(&executable, b"synthetic macos executable");

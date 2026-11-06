@@ -2,11 +2,18 @@
 
 - [x] Implement typed Rust manifests, metadata-only ZIP auditing, and
   deterministic derived-manifest plans (no payload synthesis).
+- [x] Materialize complete rename-only plans with payload CRC32/size
+  verification, deterministic driver ZIPs, atomic staged publication, and JSON
+  provenance while preserving source archives.
 - Add verified legacy drivers to the FBNeo fork.
 - Produce native Linux and Windows runtime bundles.
 - Validate a lawful BIOS source and replace the corrupt Metal Slug X C3 member.
-- [ ] Add portable controls, DIP switches, saves, and input replays (portable
-  profile storage and isolated save/state paths are implemented).
+- [ ] Add portable DIP switches and input replays. Portable profiles, governed
+  controls, and isolated save/state paths are implemented.
+- [x] Add fully editable keyboard/gamepad mappings with per-player and
+  per-device profiles, axes/deadzones, hot remap, physical conflict detection,
+  bounded portable import/export, backend limitation errors, and netplay
+  behavioral hashing; defaults remain optional presets only.
 - [ ] Build and pin the custom FBNeo libretro core plus a minimal governed
   RetroArch runtime (launcher contract is implemented).
 - [x] Add zero-service same-subnet UDP broadcast/multicast discovery and strict
